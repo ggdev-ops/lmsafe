@@ -1,0 +1,12 @@
+[package]
+name = "sysreflect"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sysreflect"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+sysinfo = "0.33.1"
+serde = "1.0.228"
