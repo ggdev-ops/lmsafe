@@ -139,6 +139,7 @@ mod tests {
             assert!(_cpu >= -2.0);
             
             let _mem = sysreflect_get_total_memory(monitor);
+            // On some CI it might be 0 if restricted, but usually > 0
             
             let host_ptr = sysreflect_get_host_name(monitor);
             assert!(!host_ptr.is_null());
@@ -158,3 +159,5 @@ mod tests {
         assert!(sysreflect_get_host_name(std::ptr::null_mut()).is_null());
     }
 }
+
+

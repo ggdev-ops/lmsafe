@@ -9,4 +9,6 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 sysinfo = "0.33.1"
-serde = "1.0.228"
+serde = { version = "1.0.228", features = ["derive"] }
+
+

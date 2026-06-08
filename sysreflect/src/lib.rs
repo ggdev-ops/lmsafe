@@ -54,6 +54,7 @@ impl SystemMonitor {
         let used = self.sys.used_memory();
         
         if total == 0 {
+            // Try fallback via libc if possible (simplified here)
             MetricStatus::Restricted
         } else {
             MetricStatus::Available((total, used))
@@ -149,7 +150,7 @@ mod tests {
                 assert!(total > 0);
             }
             MetricStatus::Restricted => {
-                // Restricted is allowed on some platforms
+                // Restricted is allowed on some platforms but let's see
             }
             MetricStatus::Unavailable => panic!("Memory info unavailable"),
         }
@@ -159,5 +160,8 @@ mod tests {
     fn test_refresh() {
         let mut monitor = SystemMonitor::new();
         monitor.refresh();
+        // Just ensuring it doesn't panic
     }
 }
+
+
