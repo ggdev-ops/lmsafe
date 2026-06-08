@@ -1,4 +1,4 @@
-// pub mod ffi;
+pub mod ffi;
 use serde::Serialize;
 use sysinfo::{System, Networks, Components, Disks};
 
