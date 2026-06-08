@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,6 +53,12 @@ uint64_t sysreflect_get_net_tx(SystemMonitor* ptr);
 
 // Free a string returned by SysReflect functions
 void sysreflect_free_string(char* ptr);
+
+// Inspect a model file or directory. Returns a JSON string that MUST be freed with sysreflect_free_string.
+char* sysreflect_inspect_model(const char* path);
+
+// Check if a model file or directory is safe to load based on system resources and safety margin
+bool sysreflect_model_is_safe_to_load(const char* path, double safety_margin);
 
 #ifdef __cplusplus
 }

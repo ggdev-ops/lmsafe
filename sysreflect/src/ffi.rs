@@ -114,6 +114,44 @@ pub extern "C" fn sysreflect_get_net_tx(ptr: *mut SystemMonitor) -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn sysreflect_inspect_model(path_ptr: *const c_char) -> *mut c_char {
+    if path_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    
+    let c_str = unsafe { std::ffi::CStr::from_ptr(path_ptr) };
+    let path_str = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return CString::new(r#"{"error":"Invalid UTF-8 path"}"#).unwrap().into_raw(),
+    };
+    
+    match crate::model::inspect_model_file(path_str) {
+        Ok(report) => {
+            match serde_json::to_string(&report) {
+                Ok(json) => CString::new(json).unwrap().into_raw(),
+                Err(e) => CString::new(format!(r#"{{"error":"Serialization failed: {}"}}"#, e)).unwrap().into_raw(),
+            }
+        }
+        Err(e) => CString::new(format!(r#"{{"error":"Inspection failed: {}"}}"#, e)).unwrap().into_raw(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sysreflect_model_is_safe_to_load(path_ptr: *const c_char, safety_margin: f64) -> bool {
+    if path_ptr.is_null() {
+        return false;
+    }
+    
+    let c_str = unsafe { std::ffi::CStr::from_ptr(path_ptr) };
+    let path_str = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    
+    crate::model::model_is_safe_to_load(path_str, safety_margin)
+}
+
+#[no_mangle]
 pub extern "C" fn sysreflect_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe {

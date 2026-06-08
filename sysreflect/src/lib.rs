@@ -1,4 +1,5 @@
 pub mod ffi;
+pub mod model;
 use serde::Serialize;
 use sysinfo::{System, Networks, Components, Disks};
 

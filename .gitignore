@@ -1,2 +1,6 @@
 /target
 /tmp
+.gradle/
+build/
+local.properties
+.kotlin/
