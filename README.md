@@ -97,11 +97,9 @@ At the code level: `isSafeToLoad(path, safetyMargin)`.
 | `AudioSegmentation` | GGML/ONNX | Filename + directory heuristics |
 | `SafeTensors` | SafeTensors | 8-byte header → JSON parse |
 
-> Image/video diffusion models (e.g. Stable Diffusion, Flux) are not supported yet — future plan. The inspector rejects them instead of misreporting them as another family.
-
 ### Media Safe Zone
 
-The Shield also governs media assets (videos and images) that models consume or produce. Media admission uses a **disk-space check** rather than RAM-based checks:
+The Media Safe Zone is **not AI-related** — that is what makes it unique. It is a standalone file store for videos and images, governed by a **disk-space check** rather than RAM-based checks:
 
 ```
 file_size * safety_margin <= available_disk_space
@@ -146,8 +144,10 @@ graph TD
 
 | Aspect | Model Safe Zone | Media Safe Zone |
 |--------|----------------|-----------------|
+| Purpose | AI-related (model inference) | Not AI-related (standalone file store) |
 | Admission check | RAM-based (`isSafeToLoad`) | Disk-based (`is_storage_safe_for_duplication`) |
 | Copy behavior | Platform-dependent (copies on Android, path-reference on Desktop) | Always copies the file |
+| Per-file add | No | Yes (`copy_media_to_safe_zone`) |
 | Per-file removal | No (only full `clean_safe_zone` wipe) | Yes (`remove_media_from_safe_zone` with path traversal protection) |
 | Listing | First model only (`get_first_stored_model`) | Full listing with metadata (`list_media_safe_zone` → `MediaInfo[]`) |
 

@@ -71,7 +71,7 @@ mod macos_unified_mem {
     /// not the sum of page states which can undercount on Apple Silicon.
     fn physical_memory_bytes() -> Option<u64> {
         unsafe {
-            let name = "hw.memsize\0".as_ptr() as *const libc::c_char;
+            let name = c"hw.memsize".as_ptr();
             let mut size: u64 = 0;
             let mut len = std::mem::size_of::<u64>();
             let rc = sysctlbyname(

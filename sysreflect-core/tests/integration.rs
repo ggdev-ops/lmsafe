@@ -7,6 +7,11 @@ use sysreflect_core::*;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+// Storage tests share one process-global SafeZone base path (first
+// init_storage wins), so they must not run concurrently, and tests that
+// assert on directory contents clean their zone first.
+static STORAGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn unique_temp_dir() -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
     std::env::temp_dir().join(format!("lmsafe_test_{}_{}", std::process::id(), id))
@@ -205,6 +210,7 @@ fn test_model_is_safe_to_load_small_file() {
 
 #[test]
 fn test_storage_init_and_get_base_path() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
     let base = get_base_path();
@@ -214,6 +220,7 @@ fn test_storage_init_and_get_base_path() {
 
 #[test]
 fn test_storage_get_safe_zone_dir() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
     let safe_dir = get_safe_zone_dir(ModelFamily::LlamaCpp).unwrap();
@@ -225,6 +232,7 @@ fn test_storage_get_safe_zone_dir() {
 
 #[test]
 fn test_storage_get_media_safe_zone_dir() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
     let video_dir = get_media_safe_zone_dir(MediaFamily::Video).unwrap();
@@ -236,6 +244,7 @@ fn test_storage_get_media_safe_zone_dir() {
 
 #[test]
 fn test_storage_clean_safe_zone() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
     let safe_dir = get_safe_zone_dir(ModelFamily::LlamaCpp).unwrap();
@@ -249,6 +258,7 @@ fn test_storage_clean_safe_zone() {
 
 #[test]
 fn test_storage_copy_to_safe_zone() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
     let source_dir = dir.join("source");
@@ -267,6 +277,7 @@ fn test_storage_copy_to_safe_zone() {
 
 #[test]
 fn test_storage_copy_to_safe_zone_nonexistent_source() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
     let result = copy_to_safe_zone("/nonexistent/file.gguf", ModelFamily::LlamaCpp, 1.2);
@@ -276,8 +287,10 @@ fn test_storage_copy_to_safe_zone_nonexistent_source() {
 
 #[test]
 fn test_storage_get_first_stored_model() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
+    clean_safe_zone(ModelFamily::LlamaCpp).unwrap();
     let safe_dir = get_safe_zone_dir(ModelFamily::LlamaCpp).unwrap();
     fs::create_dir_all(&safe_dir).unwrap();
     fs::write(safe_dir.join("model.gguf"), b"test").unwrap();
@@ -327,8 +340,10 @@ fn test_media_family_as_str() {
 
 #[test]
 fn test_list_media_safe_zone_empty() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
+    clean_media_safe_zone(MediaFamily::Video).unwrap();
     let files = list_media_safe_zone(MediaFamily::Video).unwrap();
     assert!(files.is_empty());
     let _ = fs::remove_dir_all(&dir);
@@ -336,8 +351,10 @@ fn test_list_media_safe_zone_empty() {
 
 #[test]
 fn test_list_media_safe_zone_with_files() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
+    clean_media_safe_zone(MediaFamily::Image).unwrap();
     let media_dir = get_media_safe_zone_dir(MediaFamily::Image).unwrap();
     fs::create_dir_all(&media_dir).unwrap();
     let f1 = media_dir.join("photo.jpg");
@@ -358,8 +375,10 @@ fn test_list_media_safe_zone_with_files() {
 
 #[test]
 fn test_remove_media_from_safe_zone() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
+    clean_media_safe_zone(MediaFamily::Video).unwrap();
     let media_dir = get_media_safe_zone_dir(MediaFamily::Video).unwrap();
     fs::create_dir_all(&media_dir).unwrap();
     let keep = media_dir.join("other.mp4");
@@ -376,6 +395,7 @@ fn test_remove_media_from_safe_zone() {
 
 #[test]
 fn test_remove_media_from_safe_zone_not_found() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
     let media_dir = get_media_safe_zone_dir(MediaFamily::Video).unwrap();
@@ -388,6 +408,7 @@ fn test_remove_media_from_safe_zone_not_found() {
 
 #[test]
 fn test_remove_media_from_safe_zone_path_traversal() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     try_init_storage(&dir);
     let media_dir = get_media_safe_zone_dir(MediaFamily::Video).unwrap();
@@ -607,6 +628,7 @@ fn test_capability_inference_litertlm() {
 
 #[test]
 fn test_is_storage_safe_for_duplication() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap();
     let dir = unique_temp_dir();
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("test.bin");
@@ -617,35 +639,5 @@ fn test_is_storage_safe_for_duplication() {
         "/nonexistent/file.bin",
         1.2
     ));
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn test_diffusion_models_are_unsupported() {
-    // Image/video diffusion models are a future plan: detection must reject
-    // them instead of misreporting them as another family.
-    let dir = unique_temp_dir();
-    fs::create_dir_all(&dir).unwrap();
-    let model_dir = dir.join("flux-1-schnell");
-    fs::create_dir_all(&model_dir).unwrap();
-    fs::write(
-        model_dir.join("config.json"),
-        r#"{"model_type": "flux", "architectures": ["FluxForConditionalGeneration"]}"#,
-    )
-    .unwrap();
-    // Minimal safetensors header with diffusion weights.
-    let json_header = r#"{"__metadata__":{"name":"flux-1-schnell"},"transformer.diffusion_model.weight":{"dtype":"F16","shape":[10,10]}}"#;
-    let json_bytes = json_header.as_bytes();
-    let mut data = Vec::new();
-    data.extend_from_slice(&(json_bytes.len() as u64).to_le_bytes());
-    data.extend_from_slice(json_bytes);
-    fs::write(model_dir.join("model.safetensors"), &data).unwrap();
-
-    let result = inspect_model_file(&model_dir);
-    assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("not supported yet"));
     let _ = fs::remove_dir_all(&dir);
 }

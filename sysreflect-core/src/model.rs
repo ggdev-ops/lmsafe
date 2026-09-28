@@ -37,6 +37,7 @@ impl ModelFamily {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "llama-cpp" => ModelFamily::LlamaCpp,
@@ -365,10 +366,10 @@ impl<R: Read + Seek> GgufParser<R> {
             2 | 3 => {
                 self.reader.seek(SeekFrom::Current(2))?;
             } // u16, i16
-            4 | 5 | 6 => {
+            4..=6 => {
                 self.reader.seek(SeekFrom::Current(4))?;
             } // u32, i32, f32
-            10 | 11 | 12 => {
+            10..=12 => {
                 self.reader.seek(SeekFrom::Current(8))?;
             } // u64, i64, f64
             8 => {
@@ -789,33 +790,6 @@ fn parse_llama_gguf<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionR
     let _is_llama3 = arch == "llama"
         && (chat_template.contains("header_id") || chat_template.contains("eot_id"));
     let _is_gemma = arch.starts_with("gemma");
-
-    let lower_arch = arch.to_lowercase();
-    let lower_name = name.to_lowercase();
-    let is_diffusion = lower_arch.contains("diffusion")
-        || lower_arch.contains("sd")
-        || lower_arch.contains("flux")
-        || lower_arch.contains("wan")
-        || lower_arch.contains("ltx")
-        || lower_arch.contains("hunyuan")
-        || lower_arch.contains("esrgan")
-        || lower_name.contains("flux")
-        || lower_name.contains("stable-diffusion")
-        || lower_name.contains("sdxl")
-        || lower_name.contains("sd1")
-        || lower_name.contains("sd2")
-        || lower_name.contains("sd3")
-        || lower_name.contains("wan2")
-        || lower_name.contains("esrgan");
-
-    // Image/video diffusion models are not supported yet (future plan).
-    // Reject them here so they are never misreported as text models.
-    if is_diffusion {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Stable diffusion models are not supported yet (future plan)",
-        ));
-    }
 
     let inferred_capabilities = Vec::new();
     let family = ModelFamily::LlamaCpp;
@@ -1638,7 +1612,7 @@ fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspection
         .unwrap_or(model_name);
 
     if name.contains('/') {
-        if let Some(last) = name.split('/').last() {
+        if let Some(last) = name.rsplit('/').next() {
             name = last.to_string();
         }
     }
@@ -1659,7 +1633,6 @@ fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspection
     let mut has_lm_head = false;
     let mut has_vision_keys = false;
     let mut has_audio_keys = false;
-    let mut has_diffusion_keys = false;
 
     if let Some(obj) = header_val.as_object() {
         for key in obj.keys() {
@@ -1675,13 +1648,6 @@ fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspection
             }
             if lower_key.contains("vision") || lower_key.contains("patch_embed") {
                 has_vision_keys = true;
-            }
-            if lower_key.contains("diffusion_model")
-                || lower_key.contains("unet")
-                || lower_key.contains("latent")
-                || lower_key.contains("vae")
-            {
-                has_diffusion_keys = true;
             }
             if lower_key.contains("audio")
                 || (lower_key.contains("encoder") && lower_key.contains("conv"))
@@ -1704,23 +1670,6 @@ fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspection
                 }
             }
         }
-    }
-
-    let is_diffusion = has_diffusion_keys
-        || model_type.contains("diffusion")
-        || model_type.contains("unet")
-        || model_type.contains("vae")
-        || archs
-            .iter()
-            .any(|a| a.contains("diffusion") || a.contains("unet") || a.contains("vae"));
-
-    // Image/video diffusion models are not supported yet (future plan).
-    // Reject them here so they are never misreported as text models.
-    if is_diffusion {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Stable diffusion models are not supported yet (future plan)",
-        ));
     }
 
     let lower_name = name.to_lowercase();
@@ -2075,8 +2024,10 @@ fn get_mp4_duration_ms(path: &std::path::Path) -> Option<(u64, usize)> {
                     buffer[data_start + 18],
                     buffer[data_start + 19],
                 ]) as u64;
-                if timescale > 0 {
-                    let duration_ms = (duration * 1000) / timescale;
+                if let Some(duration_ms) = duration
+                    .checked_mul(1000)
+                    .and_then(|total| total.checked_div(timescale))
+                {
                     let frame_count = (duration_ms * 30) / 1000;
                     return Some((duration_ms, std::cmp::max(frame_count as usize, 1)));
                 }
@@ -2097,8 +2048,10 @@ fn get_mp4_duration_ms(path: &std::path::Path) -> Option<(u64, usize)> {
                     buffer[data_start + 30],
                     buffer[data_start + 31],
                 ]);
-                if timescale > 0 {
-                    let duration_ms = (duration * 1000) / timescale;
+                if let Some(duration_ms) = duration
+                    .checked_mul(1000)
+                    .and_then(|total| total.checked_div(timescale))
+                {
                     let frame_count = (duration_ms * 30) / 1000;
                     return Some((duration_ms, std::cmp::max(frame_count as usize, 1)));
                 }
