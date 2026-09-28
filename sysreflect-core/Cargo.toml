@@ -1,0 +1,21 @@
+[package]
+name = "sysreflect-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sysreflect_core"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+sysinfo = "0.33.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.10"
+walkdir = "2.3"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.21"
+libc = "0.2"
+fs_extra = "1.3"
+tracing = "0.1"

@@ -1,0 +1,13 @@
+[package]
+name = "lmsafe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "lmsafe"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+sysreflect-core = { path = "../sysreflect-core" }
+serde_json = "1.0"
+libc = "0.2"

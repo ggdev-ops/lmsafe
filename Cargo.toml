@@ -1,8 +1,7 @@
 [workspace]
 members = [
-    "sysreflect",
-    "lmsafe-tui", "tmp/tokenizer-play", "tmp/gguf-play",
+    "sysreflect-core",
+    "lmsafe-ffi",
+    "lmsafe-tui", "lmsafe-cli",
 ]
 resolver = "2"
-
-
