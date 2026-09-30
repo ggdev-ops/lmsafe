@@ -105,7 +105,7 @@ bool lmsafe_init_storage(const char* base_path, bool sandboxed);
 // Copy a model into the secure Safe Zone, segregated by model family.
 // Returns a C string of the new destination path that MUST be freed.
 // Returns null on error - call lmsafe_last_error() for details.
-char* lmsafe_copy_to_safe_zone(const char* source_path, const char* family_str);
+char* lmsafe_copy_to_safe_zone(const char* source_path, const char* family_str, double safety_margin);
 
 // Clear out the Safe Zone storage for a particular model family
 bool lmsafe_clean_safe_zone(const char* family_str);

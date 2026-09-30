@@ -317,6 +317,7 @@ pub extern "C" fn lmsafe_init_storage(base_path: *const c_char, sandboxed: bool)
 pub extern "C" fn lmsafe_copy_to_safe_zone(
     source_path: *const c_char,
     family_str: *const c_char,
+    safety_margin: f64,
 ) -> *mut c_char {
     clear_last_error();
     if source_path.is_null() || family_str.is_null() {
@@ -344,7 +345,15 @@ pub extern "C" fn lmsafe_copy_to_safe_zone(
 
     let family = ModelFamily::from_str(fam_str);
 
-    match copy_to_safe_zone(src, family, 1.2) {
+    // 0.0 disables the gate (no headroom required); negative is invalid input,
+    // fail safe to the 1.2 default rather than accidentally disabling.
+    let margin = if safety_margin < 0.0 {
+        1.2
+    } else {
+        safety_margin
+    };
+
+    match copy_to_safe_zone(src, family, margin) {
         Ok(path) => {
             let path_str = path.to_string_lossy().into_owned();
             CString::new(path_str)
@@ -395,7 +404,7 @@ pub extern "C" fn lmsafe_copy_media_to_safe_zone(
         }
     };
 
-    let margin = if safety_margin <= 0.0 {
+    let margin = if safety_margin < 0.0 {
         1.2
     } else {
         safety_margin
