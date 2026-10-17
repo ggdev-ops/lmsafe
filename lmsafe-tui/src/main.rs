@@ -3,24 +3,24 @@ use color_eyre::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use lmsafe_zone::Verdict;
+use lmsafe_zone::admission::assess_with_monitor;
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, BorderType, Borders, Gauge, Paragraph, Row, Sparkline, Table},
-    Terminal,
 };
 use std::{
     io,
     path::PathBuf,
     time::{Duration, Instant},
 };
-use sysreflect_core::{
-    model::{get_recursive_size, inspect_model_file, ModelInspectionReport},
-    MetricStatus, SystemMonitor,
-};
+use sysreflect_core::{MetricStatus, SystemMonitor, format_bytes};
+use sysreflect_model::{ModelInspectionReport, get_recursive_size, inspect_model_file};
 
 #[derive(Parser)]
 #[command(
@@ -39,22 +39,6 @@ struct Cli {
     safety_margin: f64,
 }
 
-fn format_bytes(bytes: u64) -> String {
-    let kb = bytes as f64 / 1024.0;
-    let mb = kb / 1024.0;
-    let gb = mb / 1024.0;
-
-    if gb >= 1.0 {
-        format!("{:.2} GB", gb)
-    } else if mb >= 1.0 {
-        format!("{:.2} MB", mb)
-    } else if kb >= 1.0 {
-        format!("{:.2} KB", kb)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
 struct App {
     monitor: SystemMonitor,
     cpu_history: Vec<u64>,
@@ -69,7 +53,7 @@ impl App {
         let model_report = model_path
             .as_ref()
             .and_then(|path| inspect_model_file(path).ok());
-        let model_size = model_path.as_ref().map(get_recursive_size).unwrap_or(0);
+        let model_size = model_path.as_ref().map_or(0, get_recursive_size);
 
         Self {
             monitor: SystemMonitor::new(),
@@ -84,6 +68,16 @@ impl App {
     fn on_tick(&mut self) {
         self.monitor.refresh();
         let cpu_val = match self.monitor.global_cpu_usage() {
+            // History is sampled as whole percent; the sparkline has no use for
+            // sub-percent resolution.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "history series stores whole percent"
+            )]
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "CPU percent is non-negative; the cast saturates"
+            )]
             MetricStatus::Available(v) => v as u64,
             _ => 0,
         };
@@ -132,14 +126,12 @@ fn run_tui(model_path: Option<PathBuf>, safety_margin: f64) -> Result<()> {
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
 
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press
-                    && (key.code == KeyCode::Char('q') || key.code == KeyCode::Esc)
-                {
-                    break;
-                }
-            }
+        if event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+            && (key.code == KeyCode::Char('q') || key.code == KeyCode::Esc)
+        {
+            break;
         }
 
         if last_tick.elapsed() >= tick_rate {
@@ -198,11 +190,7 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
             6
         }
     } else {
-        if show_sparkline {
-            10
-        } else {
-            5
-        }
+        if show_sparkline { 10 } else { 5 }
     };
     constraints.push(Constraint::Length(middle_height));
 
@@ -272,14 +260,13 @@ fn render_too_small(f: &mut ratatui::Frame, area: Rect) {
 fn render_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let (host, os, kernel, uptime) = app.monitor.host_info();
     let net_info = match app.monitor.network_throughput() {
-        MetricStatus::Available((rx, tx)) => format!("Net RX: {} B | TX: {} B", rx, tx),
+        MetricStatus::Available((rx, tx)) => format!("Net RX: {rx} B | TX: {tx} B"),
         MetricStatus::Restricted => "Net: Access Denied".to_string(),
         MetricStatus::Unavailable => "Net: N/A".to_string(),
     };
 
     let header = Paragraph::new(format!(
-        "Host: {} | OS: {} | Kernel: {} | Uptime: {}s | {}",
-        host, os, kernel, uptime, net_info
+        "Host: {host} | OS: {os} | Kernel: {kernel} | Uptime: {uptime}s | {net_info}"
     ))
     .block(
         Block::default()
@@ -289,6 +276,65 @@ fn render_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
             .title(" ✨ System Status "),
     );
     f.render_widget(header, area);
+}
+
+/// Bytes as a float, for percentage and GB display math. Precision loss only
+/// begins near 2^53 bytes (~9 PB), far beyond any host this reads.
+fn bytes_f64(bytes: u64) -> f64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte counts are divided for display arithmetic"
+    )]
+    let result = bytes as f64;
+    result
+}
+
+/// Whole percent for a gauge. Rust's float-to-int cast saturates, so NaN or
+/// out-of-range telemetry cannot produce a wild gauge value.
+fn gauge_percent(value: f64) -> u16 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "whole percent is the gauge's resolution"
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "percentages are non-negative; the cast saturates on NaN"
+    )]
+    let result = value as u16;
+    result
+}
+
+/// CPU gauge value and its label. Shared by both resource layouts.
+fn cpu_gauge_values(app: &App) -> (u16, String) {
+    match app.monitor.global_cpu_usage() {
+        MetricStatus::Available(v) => (gauge_percent(f64::from(v)), format!("{v:.1}%")),
+        MetricStatus::Restricted => (0, "Restricted (Access Denied)".to_string()),
+        MetricStatus::Unavailable => (0, "N/A".to_string()),
+    }
+}
+
+/// Memory gauge value and its label. Shared by both resource layouts.
+fn mem_gauge_values(app: &App) -> (u16, String) {
+    match app.monitor.memory_info() {
+        MetricStatus::Available((total, used)) => {
+            let p = if total > 0 {
+                gauge_percent(bytes_f64(used) / bytes_f64(total) * 100.0)
+            } else {
+                0
+            };
+            (
+                p,
+                format!(
+                    "{:.1} / {:.1} GB ({:.1}%)",
+                    bytes_f64(used) / 1e9,
+                    bytes_f64(total) / 1e9,
+                    p
+                ),
+            )
+        }
+        MetricStatus::Restricted => (0, "Memory: Access Denied".to_string()),
+        MetricStatus::Unavailable => (0, "Memory: N/A".to_string()),
+    }
 }
 
 fn render_resources(f: &mut ratatui::Frame, app: &App, area: Rect, show_sparkline: bool) {
@@ -325,11 +371,7 @@ fn render_resources(f: &mut ratatui::Frame, app: &App, area: Rect, show_sparklin
         cpu_chunk_idx += 1;
     }
 
-    let (cpu_percent, cpu_label) = match app.monitor.global_cpu_usage() {
-        MetricStatus::Available(v) => (v as u16, format!("{:.1}%", v)),
-        MetricStatus::Restricted => (0, "Restricted (Access Denied)".to_string()),
-        MetricStatus::Unavailable => (0, "N/A".to_string()),
-    };
+    let (cpu_percent, cpu_label) = cpu_gauge_values(app);
 
     let cpu_gauge = Gauge::default()
         .block(
@@ -350,26 +392,7 @@ fn render_resources(f: &mut ratatui::Frame, app: &App, area: Rect, show_sparklin
         .constraints([Constraint::Percentage(100)])
         .split(chunks[1]);
 
-    let (mem_percent, mem_label) = match app.monitor.memory_info() {
-        MetricStatus::Available((total, used)) => {
-            let p = if total > 0 {
-                (used as f64 / total as f64 * 100.0) as u16
-            } else {
-                0
-            };
-            (
-                p,
-                format!(
-                    "{:.1} / {:.1} GB ({:.1}%)",
-                    used as f64 / 1e9,
-                    total as f64 / 1e9,
-                    p
-                ),
-            )
-        }
-        MetricStatus::Restricted => (0, "Memory: Access Denied".to_string()),
-        MetricStatus::Unavailable => (0, "Memory: N/A".to_string()),
-    };
+    let (mem_percent, mem_label) = mem_gauge_values(app);
 
     let mem_gauge = Gauge::default()
         .block(
@@ -420,11 +443,7 @@ fn render_resources_split(f: &mut ratatui::Frame, app: &App, area: Rect, show_sp
         chunk_idx += 1;
     }
 
-    let (cpu_percent, cpu_label) = match app.monitor.global_cpu_usage() {
-        MetricStatus::Available(v) => (v as u16, format!("{:.1}%", v)),
-        MetricStatus::Restricted => (0, "Restricted (Access Denied)".to_string()),
-        MetricStatus::Unavailable => (0, "N/A".to_string()),
-    };
+    let (cpu_percent, cpu_label) = cpu_gauge_values(app);
 
     let cpu_gauge = Gauge::default()
         .block(
@@ -440,26 +459,7 @@ fn render_resources_split(f: &mut ratatui::Frame, app: &App, area: Rect, show_sp
     f.render_widget(cpu_gauge, cpu_chunks[chunk_idx]);
     chunk_idx += 1;
 
-    let (mem_percent, mem_label) = match app.monitor.memory_info() {
-        MetricStatus::Available((total, used)) => {
-            let p = if total > 0 {
-                (used as f64 / total as f64 * 100.0) as u16
-            } else {
-                0
-            };
-            (
-                p,
-                format!(
-                    "{:.1} / {:.1} GB ({:.1}%)",
-                    used as f64 / 1e9,
-                    total as f64 / 1e9,
-                    p
-                ),
-            )
-        }
-        MetricStatus::Restricted => (0, "Memory: Access Denied".to_string()),
-        MetricStatus::Unavailable => (0, "Memory: N/A".to_string()),
-    };
+    let (mem_percent, mem_label) = mem_gauge_values(app);
 
     let mem_gauge = Gauge::default()
         .block(
@@ -475,38 +475,160 @@ fn render_resources_split(f: &mut ratatui::Frame, app: &App, area: Rect, show_sp
     f.render_widget(mem_gauge, cpu_chunks[chunk_idx]);
 }
 
-fn render_security_guard(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let required_bytes = (app.model_size as f64 * app.safety_margin) as u64;
-
-    let (verdict_text, verdict_style) = match app.monitor.memory_info() {
-        MetricStatus::Available((total, used)) => {
-            let available = total.saturating_sub(used);
-            if available > required_bytes {
-                (
-                    format!(
-                        "🟢 ACCEPTED: Safe to load (Free RAM: {} > Required: {})",
-                        format_bytes(available),
-                        format_bytes(required_bytes)
-                    ),
-                    Style::default()
-                        .fg(Color::Rgb(34, 197, 94))
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                (
-                    format!(
-                        "🔴 REJECTED: OOM Risk (Free RAM: {} < Required: {})",
-                        format_bytes(available),
-                        format_bytes(required_bytes)
-                    ),
-                    Style::default()
-                        .fg(Color::Rgb(239, 68, 68))
-                        .add_modifier(Modifier::BOLD),
-                )
-            }
+/// Detail lines shown under the admission verdict. Split by family because an
+/// audio-segmentation report carries different metadata than a generic one.
+fn model_detail_lines(app: &App, render_full_details: bool) -> Vec<ratatui::text::Line<'static>> {
+    let Some(ref report) = app.model_report else {
+        let mut lines = vec![ratatui::text::Line::from(format!(
+            "  Path: {}",
+            app.model_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ))];
+        if render_full_details {
+            lines.push(ratatui::text::Line::from(
+                "  (Model report unavailable - metadata parsing failed)",
+            ));
         }
-        _ => (
-            "🟡 UNKNOWN: Telemetry Restricted".to_string(),
+        return lines;
+    };
+
+    let mut lines = vec![ratatui::text::Line::from(format!(
+        "  Model Name: {}",
+        report.name
+    ))];
+
+    if report.family == sysreflect_model::ModelFamily::AudioSegmentation {
+        lines.extend(silero_detail_lines(report, app, render_full_details));
+    } else {
+        lines.extend(generic_detail_lines(report, app, render_full_details));
+    }
+    lines
+}
+
+/// Lines for the Silero audio-segmentation model, which reports architecture
+/// and tensor wiring instead of quantization and parameter counts.
+fn silero_detail_lines(
+    report: &ModelInspectionReport,
+    app: &App,
+    render_full_details: bool,
+) -> Vec<ratatui::text::Line<'static>> {
+    let mut lines = vec![ratatui::text::Line::from(
+        "  Family: AudioSegmentation (Silero)",
+    )];
+    if !render_full_details {
+        return lines;
+    }
+
+    let arch = report
+        .raw_metadata
+        .get("architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Silero-RNN-v5");
+    lines.push(ratatui::text::Line::from(format!("  Architecture: {arch}")));
+    lines.push(ratatui::text::Line::from(
+        "  Capabilities: Audio/VAD, Streaming",
+    ));
+    lines.push(ratatui::text::Line::from("  Sample Rates: 8000Hz, 16000Hz"));
+    lines.push(ratatui::text::Line::from(
+        "  Tensor Check: Pass (Inputs: [audio, sr, state], Outputs: [prob, state])",
+    ));
+    lines.push(ratatui::text::Line::from(format!(
+        "  File Size: {}",
+        format_bytes(app.model_size)
+    )));
+    lines.push(ratatui::text::Line::from(format!(
+        "  Safety Margin: {:.2}x",
+        app.safety_margin
+    )));
+    lines
+}
+
+/// Lines for a generic model report.
+fn generic_detail_lines(
+    report: &ModelInspectionReport,
+    app: &App,
+    render_full_details: bool,
+) -> Vec<ratatui::text::Line<'static>> {
+    let mut lines = vec![ratatui::text::Line::from(format!(
+        "  Family: {:?}",
+        report.family
+    ))];
+
+    if !render_full_details {
+        return lines;
+    }
+
+    lines.push(ratatui::text::Line::from(format!(
+        "  Quantization: {}",
+        report.capabilities.quantization.as_deref().unwrap_or("N/A")
+    )));
+    lines.push(ratatui::text::Line::from(format!(
+        "  Parameters: {}",
+        report
+            .capabilities
+            .parameter_count
+            .as_deref()
+            .unwrap_or("N/A")
+    )));
+    lines.push(ratatui::text::Line::from(format!(
+        "  File Size: {}",
+        format_bytes(app.model_size)
+    )));
+    lines.push(ratatui::text::Line::from(format!(
+        "  Safety Margin: {:.2}x",
+        app.safety_margin
+    )));
+    lines.push(ratatui::text::Line::from(format!(
+        "  Inferred Capabilities: {:?}",
+        report.inferred_capabilities
+    )));
+
+    if let Some(serde_json::Value::Array(styles)) = report.raw_metadata.get("available_styles") {
+        let style_list: Vec<&str> = styles.iter().filter_map(|s| s.as_str()).collect();
+        lines.push(ratatui::text::Line::from(format!(
+            "  Voice Styles: {}",
+            style_list.join(", ")
+        )));
+    }
+    if let Some(serde_json::Value::Array(samples)) = report.raw_metadata.get("audio_samples") {
+        let sample_list: Vec<&str> = samples.iter().filter_map(|s| s.as_str()).collect();
+        let joined = if sample_list.len() > 4 {
+            format!(
+                "{} (+{} more)",
+                sample_list[..4].join(", "),
+                sample_list.len() - 4
+            )
+        } else {
+            sample_list.join(", ")
+        };
+        lines.push(ratatui::text::Line::from(format!(
+            "  Audio Samples: {joined}"
+        )));
+    }
+    lines
+}
+
+fn render_security_guard(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    // The verdict comes from lmsafe-zone — the same rule the CLI prints.
+    let admission = assess_with_monitor(&app.monitor, app.model_size, app.safety_margin);
+
+    let (verdict_text, verdict_style) = match admission.verdict {
+        Verdict::Accepted => (
+            format!("🟢 ACCEPTED: {}", admission.message),
+            Style::default()
+                .fg(Color::Rgb(34, 197, 94))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Verdict::Rejected => (
+            format!("🔴 REJECTED: {}", admission.message),
+            Style::default()
+                .fg(Color::Rgb(239, 68, 68))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Verdict::Unknown => (
+            format!("🟡 UNKNOWN: {}", admission.message),
             Style::default()
                 .fg(Color::Rgb(234, 179, 8))
                 .add_modifier(Modifier::BOLD),
@@ -522,119 +644,7 @@ fn render_security_guard(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
     // Render detailed metadata if screen height allows it
     let render_full_details = area.height >= 8;
-
-    if let Some(ref report) = app.model_report {
-        text.push(ratatui::text::Line::from(format!(
-            "  Model Name: {}",
-            report.name
-        )));
-
-        if report.family == sysreflect_core::model::ModelFamily::AudioSegmentation {
-            text.push(ratatui::text::Line::from(
-                "  Family: AudioSegmentation (Silero)",
-            ));
-            if render_full_details {
-                let arch = report
-                    .raw_metadata
-                    .get("architecture")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Silero-RNN-v5");
-                text.push(ratatui::text::Line::from(format!(
-                    "  Architecture: {}",
-                    arch
-                )));
-                text.push(ratatui::text::Line::from(
-                    "  Capabilities: Audio/VAD, Streaming",
-                ));
-                text.push(ratatui::text::Line::from("  Sample Rates: 8000Hz, 16000Hz"));
-                text.push(ratatui::text::Line::from(
-                    "  Tensor Check: Pass (Inputs: [audio, sr, state], Outputs: [prob, state])",
-                ));
-                text.push(ratatui::text::Line::from(format!(
-                    "  File Size: {}",
-                    format_bytes(app.model_size)
-                )));
-                text.push(ratatui::text::Line::from(format!(
-                    "  Safety Margin: {:.2}x",
-                    app.safety_margin
-                )));
-            }
-        } else {
-            text.push(ratatui::text::Line::from(format!(
-                "  Family: {:?}",
-                report.family
-            )));
-
-            if render_full_details {
-                text.push(ratatui::text::Line::from(format!(
-                    "  Quantization: {}",
-                    report.capabilities.quantization.as_deref().unwrap_or("N/A")
-                )));
-                text.push(ratatui::text::Line::from(format!(
-                    "  Parameters: {}",
-                    report
-                        .capabilities
-                        .parameter_count
-                        .as_deref()
-                        .unwrap_or("N/A")
-                )));
-                text.push(ratatui::text::Line::from(format!(
-                    "  File Size: {}",
-                    format_bytes(app.model_size)
-                )));
-                text.push(ratatui::text::Line::from(format!(
-                    "  Safety Margin: {:.2}x",
-                    app.safety_margin
-                )));
-                text.push(ratatui::text::Line::from(format!(
-                    "  Inferred Capabilities: {:?}",
-                    report.inferred_capabilities
-                )));
-
-                if let Some(serde_json::Value::Array(styles)) =
-                    report.raw_metadata.get("available_styles")
-                {
-                    let style_list: Vec<&str> = styles.iter().filter_map(|s| s.as_str()).collect();
-                    text.push(ratatui::text::Line::from(format!(
-                        "  Voice Styles: {}",
-                        style_list.join(", ")
-                    )));
-                }
-                if let Some(serde_json::Value::Array(samples)) =
-                    report.raw_metadata.get("audio_samples")
-                {
-                    let sample_list: Vec<&str> =
-                        samples.iter().filter_map(|s| s.as_str()).collect();
-                    let joined = if sample_list.len() > 4 {
-                        format!(
-                            "{} (+{} more)",
-                            sample_list[..4].join(", "),
-                            sample_list.len() - 4
-                        )
-                    } else {
-                        sample_list.join(", ")
-                    };
-                    text.push(ratatui::text::Line::from(format!(
-                        "  Audio Samples: {}",
-                        joined
-                    )));
-                }
-            }
-        }
-    } else {
-        text.push(ratatui::text::Line::from(format!(
-            "  Path: {}",
-            app.model_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        )));
-        if render_full_details {
-            text.push(ratatui::text::Line::from(
-                "  (Model report unavailable - metadata parsing failed)",
-            ));
-        }
-    }
+    text.extend(model_detail_lines(app, render_full_details));
 
     let paragraph = Paragraph::new(text).block(
         Block::default()
@@ -674,7 +684,7 @@ fn render_processes(f: &mut ratatui::Frame, app: &App, area: Rect) {
             p.pid.to_string(),
             p.name.clone(),
             format!("{:.1}%", p.cpu_usage),
-            format!("{:.1} MB", p.memory as f64 / 1024.0 / 1024.0),
+            format!("{:.1} MB", bytes_f64(p.memory) / 1024.0 / 1024.0),
         ));
     }
 
@@ -709,4 +719,166 @@ fn render_processes(f: &mut ratatui::Frame, app: &App, area: Rect) {
     .block(block);
 
     f.render_widget(table, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use sysreflect_model::{Capability, ModelCapabilities, ModelFamily};
+
+    /// Flatten rendered lines to plain strings so assertions read as the exact
+    /// text a user sees in the Security Guard panel.
+    fn flatten(lines: &[ratatui::text::Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn report(family: ModelFamily, name: &str) -> ModelInspectionReport {
+        ModelInspectionReport {
+            family,
+            name: name.to_string(),
+            version: "1.0".to_string(),
+            author: "test".to_string(),
+            uuid: String::new(),
+            capabilities: ModelCapabilities {
+                is_instruct: false,
+                has_chat_template: false,
+                has_tool_support: false,
+                has_json_support: false,
+                is_moe: false,
+                is_vision: false,
+                context_length: 0,
+                quantization: Some("Q4_0".to_string()),
+                parameter_count: None,
+            },
+            inferred_capabilities: vec![Capability::TextGeneration],
+            raw_metadata: HashMap::new(),
+        }
+    }
+
+    fn app_with(model_report: Option<ModelInspectionReport>, model_size: u64) -> App {
+        App {
+            monitor: SystemMonitor::new(),
+            cpu_history: Vec::new(),
+            model_report,
+            model_path: Some(PathBuf::from("/models/test.gguf")),
+            model_size,
+            safety_margin: 1.15,
+        }
+    }
+
+    #[test]
+    fn no_report_shows_path_and_failure_note() {
+        let app = app_with(None, 0);
+
+        assert_eq!(
+            flatten(&model_detail_lines(&app, false)),
+            vec!["  Path: /models/test.gguf"]
+        );
+        assert_eq!(
+            flatten(&model_detail_lines(&app, true)),
+            vec![
+                "  Path: /models/test.gguf",
+                "  (Model report unavailable - metadata parsing failed)",
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_report_full_details_matches_layout() {
+        let app = app_with(
+            Some(report(ModelFamily::LlamaCpp, "Test Harness Model")),
+            152,
+        );
+
+        assert_eq!(
+            flatten(&model_detail_lines(&app, true)),
+            vec![
+                "  Model Name: Test Harness Model",
+                "  Family: LlamaCpp",
+                "  Quantization: Q4_0",
+                "  Parameters: N/A",
+                "  File Size: 152 B",
+                "  Safety Margin: 1.15x",
+                "  Inferred Capabilities: [TextGeneration]",
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_report_collapses_to_name_and_family_when_short() {
+        let app = app_with(
+            Some(report(ModelFamily::LlamaCpp, "Test Harness Model")),
+            152,
+        );
+
+        assert_eq!(
+            flatten(&model_detail_lines(&app, false)),
+            vec!["  Model Name: Test Harness Model", "  Family: LlamaCpp"]
+        );
+    }
+
+    #[test]
+    fn silero_report_shows_architecture_and_tensor_wiring() {
+        let mut silero = report(ModelFamily::AudioSegmentation, "silero_vad");
+        silero.raw_metadata.insert(
+            "architecture".to_string(),
+            serde_json::Value::String("Silero-RNN-v5".to_string()),
+        );
+        let app = app_with(Some(silero), 1024);
+
+        assert_eq!(
+            flatten(&model_detail_lines(&app, true)),
+            vec![
+                "  Model Name: silero_vad",
+                "  Family: AudioSegmentation (Silero)",
+                "  Architecture: Silero-RNN-v5",
+                "  Capabilities: Audio/VAD, Streaming",
+                "  Sample Rates: 8000Hz, 16000Hz",
+                "  Tensor Check: Pass (Inputs: [audio, sr, state], Outputs: [prob, state])",
+                "  File Size: 1.00 KB",
+                "  Safety Margin: 1.15x",
+            ]
+        );
+    }
+
+    #[test]
+    fn voice_styles_and_samples_render_truncated_at_four() {
+        let mut onnx = report(ModelFamily::Onnx, "Supertonic");
+        onnx.raw_metadata.insert(
+            "available_styles".to_string(),
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("angry".to_string()),
+                serde_json::Value::String("calm".to_string()),
+            ]),
+        );
+        let samples: Vec<serde_json::Value> = (0..6)
+            .map(|i| serde_json::Value::String(format!("sample{i}")))
+            .collect();
+        onnx.raw_metadata.insert(
+            "audio_samples".to_string(),
+            serde_json::Value::Array(samples),
+        );
+        let app = app_with(Some(onnx), 1024);
+
+        let lines = flatten(&model_detail_lines(&app, true));
+        assert!(
+            lines.contains(&"  Voice Styles: angry, calm".to_string()),
+            "missing voice styles line; got {lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"  Audio Samples: sample0, sample1, sample2, sample3 (+2 more)".to_string()
+            ),
+            "missing truncated samples line; got {lines:?}"
+        );
+    }
 }

@@ -25,6 +25,7 @@ pub enum ModelFamily {
 }
 
 impl ModelFamily {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             ModelFamily::LlamaCpp => "llama-cpp",
@@ -38,6 +39,7 @@ impl ModelFamily {
     }
 
     #[allow(clippy::should_implement_trait)]
+    #[must_use]
     pub fn from_str(s: &str) -> Self {
         match s {
             "llama-cpp" => ModelFamily::LlamaCpp,
@@ -71,6 +73,13 @@ pub enum Capability {
     TextToSpeech,
 }
 
+/// Capability flags for a model. Serialized to JSON and consumed through the
+/// C FFI (Android), so the field shape is a public contract.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these bools are distinct JSON fields on the FFI contract; \
+              collapsing them into an enum/bitflags would break Android callers"
+)]
 #[derive(Debug, Serialize)]
 pub struct ModelCapabilities {
     pub is_instruct: bool,
@@ -163,86 +172,66 @@ pub fn resolve_model_path<P: AsRef<Path>>(path: P) -> std::path::PathBuf {
 // ==========================================
 // 1. Model Family Detector
 // ==========================================
+
+/// True if any direct child of `dir` carries the given file extension.
+fn dir_has_extension(dir: &Path, ext: &str) -> bool {
+    fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().extension().is_some_and(|e| e == ext))
+    })
+}
+
+/// Infer a family from a model *directory*. Returns `None` when nothing
+/// recognizable is present.
+fn probe_directory_family(path: &Path) -> Option<ModelFamily> {
+    debug!("Path is a directory, checking for directory-based model families");
+
+    let config_path = path.join("config.json");
+    let tts_path = path.join("onnx/tts.json");
+    if config_path.exists() && tts_path.exists() {
+        debug!("Found config.json and onnx/tts.json - detected as ONNX");
+        return Some(ModelFamily::Onnx);
+    }
+
+    if dir_has_extension(path, "onnx") {
+        debug!("Found .onnx file in directory - detected as ONNX");
+        return Some(ModelFamily::Onnx);
+    }
+
+    let onnx_dir = path.join("onnx");
+    if onnx_dir.is_dir() && dir_has_extension(&onnx_dir, "onnx") {
+        debug!("Found .onnx file in onnx/ subdirectory - detected as ONNX");
+        return Some(ModelFamily::Onnx);
+    }
+
+    if dir_has_extension(path, "safetensors") {
+        debug!("Found .safetensors file in directory - detected as SafeTensors");
+        return Some(ModelFamily::SafeTensors);
+    }
+
+    debug!("No recognized model files found in directory");
+    None
+}
+
 #[tracing::instrument(skip_all, fields(path = %path.as_ref().display()))]
 pub fn detect_model_family<P: AsRef<Path>>(path: P) -> ModelFamily {
     let resolved_path = resolve_model_path(path.as_ref());
     let path = resolved_path.as_path();
     info!("Detecting model family for: {}", path.display());
 
-    // Check directory structure
+    // A directory is never read as a file, so its family comes purely from
+    // which well-known artifacts it holds.
     if path.is_dir() {
-        debug!("Path is a directory, checking for directory-based model families");
-        let config_path = path.join("config.json");
-        let tts_path = path.join("onnx/tts.json");
-        if config_path.exists() && tts_path.exists() {
-            debug!("Found config.json and onnx/tts.json - detected as ONNX");
-            return ModelFamily::Onnx;
-        }
-
-        // Check for generic ONNX files inside the directory
-
-        // Check for generic ONNX files inside the directory
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                if entry
-                    .path()
-                    .extension()
-                    .map(|e| e == "onnx")
-                    .unwrap_or(false)
-                {
-                    debug!("Found .onnx file in directory - detected as ONNX");
-                    return ModelFamily::Onnx;
-                }
-            }
-        }
-
-        // Check inside "onnx" subdirectory
-        let onnx_dir = path.join("onnx");
-        if onnx_dir.is_dir() {
-            if let Ok(entries) = fs::read_dir(onnx_dir) {
-                for entry in entries.flatten() {
-                    if entry
-                        .path()
-                        .extension()
-                        .map(|e| e == "onnx")
-                        .unwrap_or(false)
-                    {
-                        debug!("Found .onnx file in onnx/ subdirectory - detected as ONNX");
-                        return ModelFamily::Onnx;
-                    }
-                }
-            }
-        }
-
-        // Check for safetensors files inside the directory
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                if entry
-                    .path()
-                    .extension()
-                    .map(|e| e == "safetensors")
-                    .unwrap_or(false)
-                {
-                    debug!("Found .safetensors file in directory - detected as SafeTensors");
-                    return ModelFamily::SafeTensors;
-                }
-            }
-        }
-
-        debug!("No recognized model files found in directory");
-        return ModelFamily::Unknown;
+        return probe_directory_family(path).unwrap_or(ModelFamily::Unknown);
     }
 
-    if path.extension().map(|e| e == "onnx").unwrap_or(false) {
+    if path.extension().is_some_and(|e| e == "onnx") {
         debug!("File extension is .onnx - detected as ONNX");
         return ModelFamily::Onnx;
     }
 
-    if path
-        .extension()
-        .map(|e| e == "safetensors")
-        .unwrap_or(false)
-    {
+    if path.extension().is_some_and(|e| e == "safetensors") {
         debug!("File extension is .safetensors - detected as SafeTensors");
         return ModelFamily::SafeTensors;
     }
@@ -353,7 +342,14 @@ impl<R: Read + Seek> GgufParser<R> {
 
     fn read_string(&mut self) -> std::io::Result<String> {
         let len = self.read_u64()?;
-        let mut buf = vec![0u8; len as usize];
+        // A corrupt header can claim a length no address space can hold.
+        let len = usize::try_from(len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "GGUF string length does not fit in usize",
+            )
+        })?;
+        let mut buf = vec![0u8; len];
         self.reader.read_exact(&mut buf)?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
@@ -375,7 +371,12 @@ impl<R: Read + Seek> GgufParser<R> {
             8 => {
                 // String
                 let len = self.read_u64()?;
-                self.reader.seek(SeekFrom::Current(len as i64))?;
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "seek offset; a length above i64::MAX is rejected by the reader"
+                )]
+                let len = len as i64;
+                self.reader.seek(SeekFrom::Current(len))?;
             }
             9 => {
                 // Array
@@ -389,7 +390,7 @@ impl<R: Read + Seek> GgufParser<R> {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Unknown value type",
-                ))
+                ));
             }
         }
         Ok(())
@@ -405,7 +406,12 @@ impl<R: Read + Seek> GgufParser<R> {
             1 => {
                 let mut buf = [0u8; 1];
                 self.reader.read_exact(&mut buf)?;
-                Value::Number((buf[0] as i8).into())
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "GGUF encodes i8 values as a raw byte; reinterpreting is the format"
+                )]
+                let signed = buf[0] as i8;
+                Value::Number(signed.into())
             }
             2 => {
                 let mut buf = [0u8; 2];
@@ -419,6 +425,10 @@ impl<R: Read + Seek> GgufParser<R> {
             }
             4 => Value::Number(self.read_u32()?.into()),
             5 => {
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "GGUF i32 values are stored as u32 bits; same width, no data lost"
+                )]
                 let val = self.read_u32()? as i32;
                 Value::Number(val.into())
             }
@@ -426,9 +436,7 @@ impl<R: Read + Seek> GgufParser<R> {
                 let mut buf = [0u8; 4];
                 self.reader.read_exact(&mut buf)?;
                 let f = f32::from_le_bytes(buf);
-                serde_json::Number::from_f64(f as f64)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
+                serde_json::Number::from_f64(f64::from(f)).map_or(Value::Null, Value::Number)
             }
             7 => {
                 let mut buf = [0u8; 1];
@@ -444,11 +452,11 @@ impl<R: Read + Seek> GgufParser<R> {
                         self.skip_value(elem_type)?;
                     }
                     Value::String(format!(
-                        "Array(type={}, count={}) /* skipped */",
-                        elem_type, count
+                        "Array(type={elem_type}, count={count}) /* skipped */"
                     ))
                 } else {
-                    let mut arr = Vec::with_capacity(count as usize);
+                    let count = usize::try_from(count).unwrap_or(0);
+                    let mut arr = Vec::with_capacity(count);
                     for _ in 0..count {
                         arr.push(self.parse_value(elem_type)?);
                     }
@@ -457,6 +465,10 @@ impl<R: Read + Seek> GgufParser<R> {
             }
             10 => Value::Number(self.read_u64()?.into()),
             11 => {
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "GGUF i64 values are stored as u64 bits; same width, no data lost"
+                )]
                 let val = self.read_u64()? as i64;
                 Value::Number(val.into())
             }
@@ -464,9 +476,7 @@ impl<R: Read + Seek> GgufParser<R> {
                 let mut buf = [0u8; 8];
                 self.reader.read_exact(&mut buf)?;
                 let f = f64::from_le_bytes(buf);
-                serde_json::Number::from_f64(f)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
+                serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number)
             }
             _ => Value::Null,
         };
@@ -533,21 +543,29 @@ impl<'a> FlatBufferReader<'a> {
         i64::from_le_bytes(buf)
     }
 
+    /// `FlatBuffer` offsets are signed i32. A negative value means the file is
+    /// corrupt; map it to the reader's `0` = "absent" sentinel instead of
+    /// letting it wrap into a huge offset.
+    fn as_offset(value: i32) -> usize {
+        usize::try_from(value).unwrap_or(0)
+    }
+
     fn get_root(&self) -> usize {
-        self.read_int(0) as usize
+        Self::as_offset(self.read_int(0))
     }
 
     fn get_field_offset(&self, table_offset: usize, field_index: usize) -> usize {
-        let vtable_offset = (table_offset as i32 - self.read_int(table_offset)) as usize;
+        let table_i32 = i32::try_from(table_offset).unwrap_or(0);
+        let vtable_offset = Self::as_offset(table_i32 - self.read_int(table_offset));
         if vtable_offset + 2 > self.data.len() {
             return 0;
         }
-        let vtable_size = self.read_short(vtable_offset) as usize;
+        let vtable_size = usize::from(self.read_short(vtable_offset));
         let field_offset_in_vtable = 4 + field_index * 2;
         if field_offset_in_vtable >= vtable_size {
             return 0;
         }
-        let offset_in_table = self.read_short(vtable_offset + field_offset_in_vtable) as usize;
+        let offset_in_table = usize::from(self.read_short(vtable_offset + field_offset_in_vtable));
         if offset_in_table == 0 {
             return 0;
         }
@@ -559,7 +577,7 @@ impl<'a> FlatBufferReader<'a> {
         if offset == 0 {
             return 0;
         }
-        offset + self.read_int(offset) as usize
+        offset + Self::as_offset(self.read_int(offset))
     }
 
     fn get_byte_field(&self, table_offset: usize, field_index: usize, default: u8) -> u8 {
@@ -594,8 +612,8 @@ impl<'a> FlatBufferReader<'a> {
         if offset == 0 {
             return None;
         }
-        offset += self.read_int(offset) as usize;
-        let length = self.read_int(offset) as usize;
+        offset += Self::as_offset(self.read_int(offset));
+        let length = Self::as_offset(self.read_int(offset));
         if offset + 4 + length > self.data.len() {
             return None;
         }
@@ -604,12 +622,12 @@ impl<'a> FlatBufferReader<'a> {
     }
 
     fn get_vector_size(&self, vector_offset: usize) -> usize {
-        self.read_int(vector_offset) as usize
+        Self::as_offset(self.read_int(vector_offset))
     }
 
     fn get_vector_element_offset(&self, vector_offset: usize, index: usize) -> usize {
         let element_pos = vector_offset + 4 + index * 4;
-        element_pos + self.read_int(element_pos) as usize
+        element_pos + Self::as_offset(self.read_int(element_pos))
     }
 
     fn get_union_value(
@@ -618,23 +636,41 @@ impl<'a> FlatBufferReader<'a> {
         type_index: usize,
         value_index: usize,
     ) -> Option<Value> {
-        let union_type = self.get_int_field(table_offset, type_index, 0) as u8;
+        let union_type = u8::try_from(self.get_int_field(table_offset, type_index, 0)).unwrap_or(0);
         let offset = self.get_indirect_offset(table_offset, value_index);
         if offset == 0 {
             return None;
         }
 
         let val = match union_type {
-            1 => Value::Number((self.data[offset] as u64).into()), // UInt8
-            2 => Value::Number((self.data[offset] as i64).into()), // Int8
-            5 => Value::Number((self.read_int(offset) as u32 as u64).into()), // UInt32
-            6 => Value::Number((self.read_int(offset) as i64).into()), // Int32
+            1 => Value::Number(u64::from(self.data[offset]).into()), // UInt8
+            2 => Value::Number(i64::from(self.data[offset]).into()), // Int8
+            5 => {
+                // FlatBuffers stores a UInt32 in an i32 slot: same width,
+                // bit-for-bit reinterpretable.
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "UInt32 lives in an i32 table slot; same width, no data lost"
+                )]
+                let bits = self.read_int(offset) as u32;
+                Value::Number(u64::from(bits).into())
+            }
+            6 => Value::Number(i64::from(self.read_int(offset)).into()), // Int32
             9 => {
                 // StringValue (a table with string field at index 0)
                 self.get_string_field(offset, 0).map(Value::String)?
             }
-            10 => Value::Number((self.read_long(offset) as u64).into()), // UInt64
-            11 => Value::Number(self.read_long(offset).into()),          // Int64
+            10 => {
+                // UInt64 lives in an i64 table slot: same width, bit pattern
+                // preserved.
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "UInt64 lives in an i64 table slot; same width, no data lost"
+                )]
+                let bits = self.read_long(offset) as u64;
+                Value::Number(bits.into())
+            }
+            11 => Value::Number(self.read_long(offset).into()), // Int64
             _ => return None,
         };
         Some(val)
@@ -664,7 +700,7 @@ impl<'a> ProtobufScanner<'a> {
         let mut value = 0u64;
         let mut shift = 0;
         while self.i < self.data.len() {
-            let b = self.data[self.i] as u64;
+            let b = u64::from(self.data[self.i]);
             self.i += 1;
             value |= (b & 0x7F) << shift;
             if (b & 0x80) == 0 {
@@ -686,7 +722,7 @@ impl<'a> ProtobufScanner<'a> {
     }
 
     fn read_string(&mut self) -> String {
-        let length = self.read_varint() as usize;
+        let length = usize::try_from(self.read_varint()).unwrap_or(0);
         if self.i + length > self.data.len() {
             return String::new();
         }
@@ -703,7 +739,7 @@ impl<'a> ProtobufScanner<'a> {
     }
 
     fn next_tag(&mut self) -> (u32, u8) {
-        let tag = self.read_varint() as u32;
+        let tag = u32::try_from(self.read_varint()).unwrap_or(0);
         self.last_wire_type = (tag & 0x7) as u8;
         let field_num = tag >> 3;
         (field_num, self.last_wire_type)
@@ -718,7 +754,7 @@ impl<'a> ProtobufScanner<'a> {
                 self.i += 8;
             }
             2 => {
-                let length = self.read_varint() as usize;
+                let length = usize::try_from(self.read_varint()).unwrap_or(0);
                 self.i += length;
             }
             5 => {
@@ -751,7 +787,7 @@ fn parse_llama_gguf<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionR
 
     // Helper macro to fetch strings/numbers
     let get_str = |k: &str| raw.get(k).and_then(|v| v.as_str()).map(String::from);
-    let get_u64 = |k: &str| raw.get(k).and_then(|v| v.as_u64());
+    let get_u64 = |k: &str| raw.get(k).and_then(serde_json::Value::as_u64);
 
     let name = get_str("general.name").unwrap_or_else(|| "Unknown Llama Model".to_string());
     let size_label = get_str("general.size_label");
@@ -782,7 +818,7 @@ fn parse_llama_gguf<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionR
         .map(String::from)
     });
 
-    let context_key = format!("{}.context_length", arch);
+    let context_key = format!("{arch}.context_length");
     let context_length = get_u64(&context_key).unwrap_or(0);
 
     let chat_template = get_str("tokenizer.chat_template").unwrap_or_default();
@@ -795,16 +831,15 @@ fn parse_llama_gguf<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionR
     let family = ModelFamily::LlamaCpp;
 
     let is_instruct = get_str("general.finetune")
-        .map(|f| f.to_lowercase().contains("instruct") || f.to_lowercase().contains("it"))
-        .unwrap_or(false)
+        .is_some_and(|f| f.to_lowercase().contains("instruct") || f.to_lowercase().contains("it"))
         || !chat_template.is_empty();
     let has_tool_support = chat_template.to_lowercase().contains("tool_calls")
         || chat_template.to_lowercase().contains("available_tools")
         || name.to_lowercase().contains("llama-3.1")
         || name.to_lowercase().contains("llama-3.2");
 
-    let _block_key = format!("{}.block_count", arch);
-    let is_moe = get_u64(&format!("{}.expert_count", arch)).unwrap_or(0) > 0;
+    let _block_key = format!("{arch}.block_count");
+    let is_moe = get_u64(&format!("{arch}.expert_count")).unwrap_or(0) > 0;
     let is_vision = arch.to_lowercase().contains("clip");
 
     let param_count = size_label.or_else(|| {
@@ -837,6 +872,11 @@ fn parse_llama_gguf<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionR
     })
 }
 
+/// Read a `LiteRT-LM` model (`FlatBuffer` header + embedded sections).
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass LiteRT-LM reader; splitting it requires parser tests first"
+)]
 fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport> {
     let path = path.as_ref();
     let mut file = File::open(path)?;
@@ -854,11 +894,12 @@ fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionRep
 
     let major = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
     let minor = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
-    let patch = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
-    let header_end_offset = u64::from_le_bytes([
+    let patch_version = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+    let header_end_offset = usize::try_from(u64::from_le_bytes([
         header[24], header[25], header[26], header[27], header[28], header[29], header[30],
         header[31],
-    ]) as usize;
+    ]))
+    .unwrap_or(0);
 
     // Read FlatBuffer header metadata
     let header_size = header_end_offset - 32;
@@ -876,10 +917,10 @@ fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionRep
             let size = fb.get_vector_size(entries_vector);
             for i in 0..size {
                 let kvp_table = fb.get_vector_element_offset(entries_vector, i);
-                if let Some(key) = fb.get_string_field(kvp_table, 0) {
-                    if let Some(val) = fb.get_union_value(kvp_table, 1, 2) {
-                        system_meta.insert(key, val);
-                    }
+                if let Some(key) = fb.get_string_field(kvp_table, 0)
+                    && let Some(val) = fb.get_union_value(kvp_table, 1, 2)
+                {
+                    system_meta.insert(key, val);
                 }
             }
         }
@@ -896,8 +937,8 @@ fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionRep
                 let data_type = fb.get_byte_field(section_table, 3, 0);
                 if data_type == 5 {
                     // LlmMetadataProto
-                    let begin = fb.get_long_field(section_table, 1, 0) as u64;
-                    let end = fb.get_long_field(section_table, 2, 0) as u64;
+                    let begin = u64::try_from(fb.get_long_field(section_table, 1, 0)).unwrap_or(0);
+                    let end = u64::try_from(fb.get_long_field(section_table, 2, 0)).unwrap_or(0);
                     proto_section = Some((begin, end));
                 }
             }
@@ -910,7 +951,9 @@ fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionRep
 
     if let Some((begin, end)) = proto_section {
         file.seek(SeekFrom::Start(begin))?;
-        let len = (end - begin) as usize;
+        // saturating: a corrupt header can list end < begin, which would
+        // otherwise underflow and panic in debug builds.
+        let len = usize::try_from(end.saturating_sub(begin)).unwrap_or(0);
         let mut proto_data = vec![0u8; len];
         file.read_exact(&mut proto_data)?;
 
@@ -922,11 +965,11 @@ fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionRep
                     max_tokens = if wire_type == 0 {
                         scanner.read_varint()
                     } else {
-                        scanner.read_fixed32() as u64
+                        u64::from(scanner.read_fixed32())
                     };
                 }
                 6 => {
-                    let length = scanner.read_varint() as usize;
+                    let length = usize::try_from(scanner.read_varint()).unwrap_or(0);
                     let bytes = scanner.read_bytes(length);
                     let mut sub_scanner = ProtobufScanner::new(bytes);
                     while sub_scanner.has_next() {
@@ -972,15 +1015,10 @@ fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionRep
 
     let chat_template = jinja.clone().unwrap_or_default();
 
-    let is_instruct = system_meta
-        .get("finetune")
-        .map(|v| {
-            v.as_str()
-                .map(|f| f.contains("instruct") || f.contains("it"))
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
-        || !chat_template.is_empty();
+    let is_instruct = system_meta.get("finetune").is_some_and(|v| {
+        v.as_str()
+            .is_some_and(|f| f.contains("instruct") || f.contains("it"))
+    }) || !chat_template.is_empty();
     let has_tool_support = chat_template.to_lowercase().contains("tool_calls")
         || chat_template.to_lowercase().contains("available_tools")
         || name.to_lowercase().contains("gemma");
@@ -988,7 +1026,7 @@ fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionRep
     let param_count = name
         .split('-')
         .find(|s| s.ends_with('b') || s.ends_with('B'))
-        .map(|s| s.to_uppercase());
+        .map(str::to_uppercase);
 
     let caps = ModelCapabilities {
         is_instruct,
@@ -996,10 +1034,7 @@ fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionRep
         has_tool_support,
         has_json_support: has_tool_support || chat_template.to_lowercase().contains("json_schema"),
         is_moe: false,
-        is_vision: model_family
-            .as_deref()
-            .map(|f| f.contains("VLM"))
-            .unwrap_or(false),
+        is_vision: model_family.as_deref().is_some_and(|f| f.contains("VLM")),
         context_length: max_tokens,
         quantization: None,
         parameter_count: param_count,
@@ -1008,7 +1043,7 @@ fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionRep
     let mut raw = system_meta;
     raw.insert("major".to_string(), Value::Number(major.into()));
     raw.insert("minor".to_string(), Value::Number(minor.into()));
-    raw.insert("patch".to_string(), Value::Number(patch.into()));
+    raw.insert("patch".to_string(), Value::Number(patch_version.into()));
     raw.insert(
         "headerEndOffset".to_string(),
         Value::Number(header_end_offset.into()),
@@ -1024,7 +1059,7 @@ fn parse_litertlm<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionRep
         inferred_capabilities: Vec::new(),
         family: ModelFamily::LiteRtLm,
         name,
-        version: format!("{}.{}.{}", major, minor, patch),
+        version: format!("{major}.{minor}.{patch_version}"),
         author,
         uuid,
         capabilities: caps,
@@ -1044,8 +1079,7 @@ fn extract_silero_info(filename: &str) -> (String, String) {
             if version_part
                 .chars()
                 .next()
-                .map(|c| c.is_ascii_digit())
-                .unwrap_or(false)
+                .is_some_and(|c| c.is_ascii_digit())
             {
                 let end_idx = version_part
                     .find(|c: char| !c.is_numeric() && c != '.')
@@ -1089,6 +1123,11 @@ fn extract_silero_info(filename: &str) -> (String, String) {
     (version, arch)
 }
 
+/// Read a Whisper/GGML model header and its hyperparameters.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass GGML header reader; splitting it requires parser tests first"
+)]
 fn parse_whisper_ggml<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport> {
     let path_ref = path.as_ref();
     let filename = path_ref.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1134,8 +1173,12 @@ fn parse_whisper_ggml<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectio
         has_json_support: false,
         is_moe: false,
         is_vision: false,
-        context_length: if is_silero_vad { 0 } else { n_text_ctx as u64 },
-        quantization: Some(format!("ftype:{}", ftype)),
+        context_length: if is_silero_vad {
+            0
+        } else {
+            u64::try_from(n_text_ctx).unwrap_or(0)
+        },
+        quantization: Some(format!("ftype:{ftype}")),
         parameter_count: Some(size_label.to_string()),
     };
 
@@ -1170,13 +1213,13 @@ fn parse_whisper_ggml<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectio
     let (version_str, arch_str) = if is_silero_vad {
         extract_silero_info(filename)
     } else {
-        ("1.0".to_string(), "".to_string())
+        ("1.0".to_string(), String::new())
     };
 
     let model_name = if is_silero_vad {
-        format!("Silero VAD v{}", version_str)
+        format!("Silero VAD v{version_str}")
     } else {
-        format!("Whisper {}", size_label)
+        format!("Whisper {size_label}")
     };
 
     let author = if is_silero_vad {
@@ -1233,12 +1276,43 @@ fn parse_whisper_ggml<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectio
             "v1.0".to_string()
         },
         author,
-        uuid: "".to_string(),
+        uuid: String::new(),
         capabilities: caps,
         raw_metadata: raw,
     })
 }
 
+/// Infer ONNX capabilities from a model's name. Both the directory path and
+/// the single-file path need this; they previously carried identical copies.
+fn onnx_capabilities_from_name(name: &str) -> Vec<Capability> {
+    let lower = name.to_lowercase();
+    let mut caps = Vec::new();
+    if lower.contains("decoder") || lower.contains("encoder") || lower.contains("llm") {
+        caps.push(Capability::TextGeneration);
+    }
+    if lower.contains("whisper") || lower.contains("stt") || lower.contains("moonshine") {
+        caps.push(Capability::SpeechToText);
+        caps.push(Capability::AudioInput);
+    }
+    if lower.contains("tts") || lower.contains("speech") || lower.contains("vocoder") {
+        caps.push(Capability::TextToSpeech);
+        caps.push(Capability::AudioOutput);
+    }
+    if lower.contains("vad") || lower.contains("silero") {
+        caps.push(Capability::AudioInput);
+    }
+    caps
+}
+
+/// Read an ONNX model's metadata. The body mixes three concerns — directory
+/// layout probing, protobuf scanning, and capability inference — which is why
+/// it exceeds the line limit. Splitting it safely needs parser tests that do
+/// not exist yet; see `tests/model.rs` (it currently covers family detection
+/// only). Keep this marker until those tests land.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass ONNX reader; splitting it requires parser tests first"
+)]
 fn parse_onnx<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport> {
     let dir = path.as_ref();
     let path_ref = path.as_ref();
@@ -1275,7 +1349,10 @@ fn parse_onnx<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport>
             let content = fs::read_to_string(&tts_path)?;
             if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content) {
                 if let Some(ae) = map.get("ae").and_then(|v| v.as_object()) {
-                    sample_rate = ae.get("sample_rate").and_then(|v| v.as_i64()).unwrap_or(0);
+                    sample_rate = ae
+                        .get("sample_rate")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
                 }
                 if let Some(v) = map.get("tts_version").and_then(|v| v.as_str()) {
                     tts_version = v.to_string();
@@ -1291,38 +1368,35 @@ fn parse_onnx<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport>
 
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content) {
-                if let Some(n) = map.get("model_name").and_then(|v| v.as_str()) {
-                    model_name = n.to_string();
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content)
+                && let Some(n) = map.get("model_name").and_then(|v| v.as_str())
+            {
+                model_name = n.to_string();
+            }
+        }
+
+        if styles_path.is_dir()
+            && let Ok(entries) = fs::read_dir(styles_path)
+        {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "json")
+                    && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                {
+                    available_styles.push(stem.to_string());
                 }
             }
         }
 
-        if styles_path.is_dir() {
-            if let Ok(entries) = fs::read_dir(styles_path) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().map(|e| e == "json").unwrap_or(false) {
-                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                            available_styles.push(stem.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        if audio_path.is_dir() {
-            if let Ok(entries) = fs::read_dir(audio_path) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension()
-                        .map(|e| e == "wav" || e == "mp3")
-                        .unwrap_or(false)
-                    {
-                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                            audio_samples.push(name.to_string());
-                        }
-                    }
+        if audio_path.is_dir()
+            && let Ok(entries) = fs::read_dir(audio_path)
+        {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "wav" || e == "mp3")
+                    && let Some(name) = p.file_name().and_then(|n| n.to_str())
+                {
+                    audio_samples.push(name.to_string());
                 }
             }
         }
@@ -1348,30 +1422,7 @@ fn parse_onnx<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport>
             );
         } else {
             // General directory scan fallback
-            let lower_name = model_name.to_lowercase();
-            if lower_name.contains("decoder")
-                || lower_name.contains("encoder")
-                || lower_name.contains("llm")
-            {
-                inferred_capabilities.push(Capability::TextGeneration);
-            }
-            if lower_name.contains("whisper")
-                || lower_name.contains("stt")
-                || lower_name.contains("moonshine")
-            {
-                inferred_capabilities.push(Capability::SpeechToText);
-                inferred_capabilities.push(Capability::AudioInput);
-            }
-            if lower_name.contains("tts")
-                || lower_name.contains("speech")
-                || lower_name.contains("vocoder")
-            {
-                inferred_capabilities.push(Capability::TextToSpeech);
-                inferred_capabilities.push(Capability::AudioOutput);
-            }
-            if lower_name.contains("vad") || lower_name.contains("silero") {
-                inferred_capabilities.push(Capability::AudioInput);
-            }
+            inferred_capabilities = onnx_capabilities_from_name(&model_name);
         }
     } else {
         // Single flat file parsing
@@ -1379,30 +1430,7 @@ fn parse_onnx<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport>
             model_name = stem.to_string();
         }
 
-        let lower_name = model_name.to_lowercase();
-        if lower_name.contains("decoder")
-            || lower_name.contains("encoder")
-            || lower_name.contains("llm")
-        {
-            inferred_capabilities.push(Capability::TextGeneration);
-        }
-        if lower_name.contains("whisper")
-            || lower_name.contains("stt")
-            || lower_name.contains("moonshine")
-        {
-            inferred_capabilities.push(Capability::SpeechToText);
-            inferred_capabilities.push(Capability::AudioInput);
-        }
-        if lower_name.contains("tts")
-            || lower_name.contains("speech")
-            || lower_name.contains("vocoder")
-        {
-            inferred_capabilities.push(Capability::TextToSpeech);
-            inferred_capabilities.push(Capability::AudioOutput);
-        }
-        if lower_name.contains("vad") || lower_name.contains("silero") {
-            inferred_capabilities.push(Capability::AudioInput);
-        }
+        inferred_capabilities = onnx_capabilities_from_name(&model_name);
     }
 
     let caps = ModelCapabilities {
@@ -1439,11 +1467,11 @@ fn parse_onnx<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport>
     let (version_str, arch_str) = if is_silero_vad {
         extract_silero_info(filename)
     } else {
-        (version.clone(), "".to_string())
+        (version.clone(), String::new())
     };
 
     let final_name = if is_silero_vad {
-        format!("Silero VAD v{}", version_str)
+        format!("Silero VAD v{version_str}")
     } else {
         model_name
     };
@@ -1504,12 +1532,17 @@ fn parse_onnx<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport>
         name: final_name,
         version: final_version,
         author: final_author,
-        uuid: "".to_string(),
+        uuid: String::new(),
         capabilities: caps,
         raw_metadata: raw,
     })
 }
 
+/// Read a `SafeTensors` file: magic, JSON header, and tensor shapes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass SafeTensors reader; splitting it requires parser tests first"
+)]
 fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport> {
     let path = path.as_ref();
     let safetensors_file_path = if path.is_dir() {
@@ -1517,7 +1550,7 @@ fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspection
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.extension().map(|e| e == "safetensors").unwrap_or(false) {
+                if p.extension().is_some_and(|e| e == "safetensors") {
                     target = Some(p);
                     break;
                 }
@@ -1547,13 +1580,13 @@ fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspection
         ));
     }
 
-    let mut header_bytes = vec![0u8; n as usize];
+    let mut header_bytes = vec![0u8; usize::try_from(n).unwrap_or(0)];
     reader.read_exact(&mut header_bytes)?;
 
     let header_val: Value = serde_json::from_slice(&header_bytes).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Failed to parse safetensors header JSON: {}", e),
+            format!("Failed to parse safetensors header JSON: {e}"),
         )
     })?;
 
@@ -1575,21 +1608,20 @@ fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspection
     let mut config_val: Option<Value> = None;
     if let Some(dir) = parent_dir {
         let config_json_path = dir.join("config.json");
-        if config_json_path.exists() {
-            if let Ok(data) = fs::read_to_string(&config_json_path) {
-                if let Ok(val) = serde_json::from_str::<Value>(&data) {
-                    config_val = Some(val);
-                }
-            }
+        if config_json_path.exists()
+            && let Ok(data) = fs::read_to_string(&config_json_path)
+            && let Ok(val) = serde_json::from_str::<Value>(&data)
+        {
+            config_val = Some(val);
         }
     }
 
-    if let Some(ref config) = config_val {
-        if let Some(obj) = config.as_object() {
-            for (k, v) in obj {
-                if !raw.contains_key(k) {
-                    raw.insert(k.clone(), v.clone());
-                }
+    if let Some(ref config) = config_val
+        && let Some(obj) = config.as_object()
+    {
+        for (k, v) in obj {
+            if !raw.contains_key(k) {
+                raw.insert(k.clone(), v.clone());
             }
         }
     }
@@ -1611,23 +1643,21 @@ fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspection
         })
         .unwrap_or(model_name);
 
-    if name.contains('/') {
-        if let Some(last) = name.rsplit('/').next() {
-            name = last.to_string();
-        }
+    if name.contains('/')
+        && let Some(last) = name.rsplit('/').next()
+    {
+        name = last.to_string();
     }
 
     let author = raw
         .get("author")
         .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| "Unknown".to_string());
+        .map_or_else(|| "Unknown".to_string(), String::from);
 
     let version = raw
         .get("version")
         .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| "v1.0".to_string());
+        .map_or_else(|| "v1.0".to_string(), String::from);
 
     let mut inferred_capabilities = Vec::new();
     let mut has_lm_head = false;
@@ -1733,9 +1763,12 @@ fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspection
         is_vision: inferred_capabilities.contains(&Capability::Vision),
         context_length: raw
             .get("context_length")
-            .and_then(|v| v.as_u64())
-            .or_else(|| raw.get("max_position_embeddings").and_then(|v| v.as_u64()))
-            .or_else(|| raw.get("max_length").and_then(|v| v.as_u64()))
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                raw.get("max_position_embeddings")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .or_else(|| raw.get("max_length").and_then(serde_json::Value::as_u64))
             .unwrap_or(0),
         quantization: quant_val,
         parameter_count: raw
@@ -1765,6 +1798,15 @@ fn parse_safetensors<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspection
     })
 }
 
+/// Inspect a model file and report its family, size, and inferred capabilities.
+///
+/// # Errors
+///
+/// * [`ErrorKind::NotFound`](std::io::ErrorKind::NotFound) when the path does
+///   not exist.
+/// * [`ErrorKind::InvalidData`](std::io::ErrorKind::InvalidData) when the
+///   magic bytes or headers cannot be parsed (truncated or corrupt file).
+/// * Other IO errors surface unchanged from opening or reading the file.
 #[tracing::instrument(skip_all, fields(path = %path.as_ref().display()))]
 pub fn inspect_model_file<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport> {
     let path_ref = path.as_ref();
@@ -1834,104 +1876,27 @@ pub fn inspect_model_file<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspe
 }
 
 // ==========================================
-// 5. Memory Security Guard
+// 5. Model Sizing
 // ==========================================
+/// Total size of a model on disk: file size for a single file, or the
+/// recursive sum for a directory layout (HF snapshots, ONNX folders).
 pub fn get_recursive_size<P: AsRef<Path>>(path: P) -> u64 {
     let path = path.as_ref();
     if path.is_file() {
-        return fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        return fs::metadata(path).map_or(0, |m| m.len());
     }
     let mut size = 0u64;
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_file() {
-                size += fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                size += fs::metadata(&p).map_or(0, |m| m.len());
             } else if p.is_dir() {
                 size += get_recursive_size(&p);
             }
         }
     }
     size
-}
-
-#[tracing::instrument(skip_all, fields(path = %path.as_ref().display(), safety_margin))]
-pub fn model_is_safe_to_load<P: AsRef<Path>>(path: P, safety_margin: f64) -> bool {
-    let original_path = path.as_ref();
-    let resolved_path = resolve_model_path(original_path);
-    let path = resolved_path.as_path();
-    info!(
-        "Checking if model is safe to load: {} (margin: {}x)",
-        path.display(),
-        safety_margin
-    );
-
-    let file_size = get_recursive_size(path);
-    debug!("Model file size: {} bytes", file_size);
-
-    if file_size == 0 {
-        warn!("Model file size is zero - not safe to load");
-        return false;
-    }
-
-    // Obtain (total, used) bytes — using the accurate unified-memory path on
-    // Apple Silicon so that GPU / Metal allocations are counted.
-    let (total, used) = {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            // Re-use the same Mach kernel helper that SystemMonitor::memory_info uses.
-            if let Some(pair) = crate::macos_unified_mem::unified_memory_info() {
-                debug!(
-                    "Using Apple Silicon unified memory: total={}, used={}",
-                    pair.0, pair.1
-                );
-                pair
-            } else {
-                let mut sys = sysinfo::System::new_all();
-                sys.refresh_all();
-                let (total, used) = (sys.total_memory(), sys.used_memory());
-                debug!("Using sysinfo fallback: total={}, used={}", total, used);
-                (total, used)
-            }
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let mut sys = sysinfo::System::new_all();
-            sys.refresh_all();
-            let (total, used) = (sys.total_memory(), sys.used_memory());
-            debug!("Using sysinfo: total={}, used={}", total, used);
-            (total, used)
-        }
-    };
-
-    if total == 0 {
-        warn!("Total memory is zero - assuming safe (restricted sandbox)");
-        return true; // restricted/fallback sandbox context, assume safe
-    }
-
-    let available = total.saturating_sub(used);
-    let required = (file_size as f64 * safety_margin) as u64;
-
-    debug!(
-        "Memory check: available={}, required={}",
-        available, required
-    );
-
-    let is_safe = available > required;
-
-    if is_safe {
-        info!(
-            "Model is SAFE to load (available={} > required={})",
-            available, required
-        );
-    } else {
-        warn!(
-            "Model is NOT safe to load (available={} <= required={})",
-            available, required
-        );
-    }
-
-    is_safe
 }
 
 // ==========================================
@@ -1961,7 +1926,7 @@ mod tests {
         let safetensors_path = temp.join("mock.safetensors");
         let json_header = r#"{"__metadata__":{"name":"MockSafetensors","author":"Tester","version":"v2.0"},"lm_head.weight":{"dtype":"F16","shape":[10,10]}}"#;
         let json_bytes = json_header.as_bytes();
-        let header_len = json_bytes.len() as u64;
+        let header_len = u64::try_from(json_bytes.len()).unwrap_or(0);
         let mut mock_data = Vec::new();
         mock_data.extend_from_slice(&header_len.to_le_bytes());
         mock_data.extend_from_slice(json_bytes);
@@ -1977,9 +1942,11 @@ mod tests {
         assert_eq!(report.name, "MockSafetensors");
         assert_eq!(report.author, "Tester");
         assert_eq!(report.version, "v2.0");
-        assert!(report
-            .inferred_capabilities
-            .contains(&Capability::TextGeneration));
+        assert!(
+            report
+                .inferred_capabilities
+                .contains(&Capability::TextGeneration)
+        );
 
         fs::remove_file(safetensors_path).unwrap();
     }
@@ -2003,7 +1970,7 @@ fn get_mp4_duration_ms(path: &std::path::Path) -> Option<(u64, usize)> {
     let file_size = file.metadata().ok()?.len();
 
     let search_limit = std::cmp::min(file_size, 10 * 1024 * 1024);
-    let mut buffer = vec![0u8; search_limit as usize];
+    let mut buffer = vec![0u8; usize::try_from(search_limit).unwrap_or(0)];
     file.read_exact(&mut buffer).ok()?;
 
     let mvhd_tag = b"mvhd";
@@ -2012,32 +1979,34 @@ fn get_mp4_duration_ms(path: &std::path::Path) -> Option<(u64, usize)> {
         if data_start + 32usize <= buffer.len() {
             let version = buffer[data_start];
             if version == 0 {
-                let timescale = u32::from_be_bytes([
+                let timescale = u64::from(u32::from_be_bytes([
                     buffer[data_start + 12],
                     buffer[data_start + 13],
                     buffer[data_start + 14],
                     buffer[data_start + 15],
-                ]) as u64;
-                let duration = u32::from_be_bytes([
+                ]));
+                let duration = u64::from(u32::from_be_bytes([
                     buffer[data_start + 16],
                     buffer[data_start + 17],
                     buffer[data_start + 18],
                     buffer[data_start + 19],
-                ]) as u64;
+                ]));
                 if let Some(duration_ms) = duration
                     .checked_mul(1000)
                     .and_then(|total| total.checked_div(timescale))
                 {
-                    let frame_count = (duration_ms * 30) / 1000;
-                    return Some((duration_ms, std::cmp::max(frame_count as usize, 1)));
+                    let frame_count = usize::try_from((duration_ms * 30) / 1000)
+                        .unwrap_or(1)
+                        .max(1);
+                    return Some((duration_ms, frame_count));
                 }
             } else if version == 1 {
-                let timescale = u32::from_be_bytes([
+                let timescale = u64::from(u32::from_be_bytes([
                     buffer[data_start + 20],
                     buffer[data_start + 21],
                     buffer[data_start + 22],
                     buffer[data_start + 23],
-                ]) as u64;
+                ]));
                 let duration = u64::from_be_bytes([
                     buffer[data_start + 24],
                     buffer[data_start + 25],
@@ -2052,8 +2021,10 @@ fn get_mp4_duration_ms(path: &std::path::Path) -> Option<(u64, usize)> {
                     .checked_mul(1000)
                     .and_then(|total| total.checked_div(timescale))
                 {
-                    let frame_count = (duration_ms * 30) / 1000;
-                    return Some((duration_ms, std::cmp::max(frame_count as usize, 1)));
+                    let frame_count = usize::try_from((duration_ms * 30) / 1000)
+                        .unwrap_or(1)
+                        .max(1);
+                    return Some((duration_ms, frame_count));
                 }
             }
         }
@@ -2061,6 +2032,14 @@ fn get_mp4_duration_ms(path: &std::path::Path) -> Option<(u64, usize)> {
     None
 }
 
+/// Inspect a media file (image/audio/video) and report its format and size.
+///
+/// # Errors
+///
+/// * A plain message when the path is not an existing regular file.
+/// * The underlying IO error, as a string, when metadata cannot be read.
+/// * `Unsupported media format: .{ext}` for any extension outside the
+///   recognized image/audio/video set.
 pub fn inspect_media_file<P: AsRef<Path>>(path: P) -> Result<MediaInspectionReport, String> {
     let p = path.as_ref();
     if !p.exists() || !p.is_file() {
@@ -2085,7 +2064,7 @@ pub fn inspect_media_file<P: AsRef<Path>>(path: P) -> Result<MediaInspectionRepo
             let (duration_ms, frame_count) = get_mp4_duration_ms(p).unwrap_or((10000, 300));
             Ok(MediaInspectionReport {
                 file_name,
-                format: format!("video/{}", ext),
+                format: format!("video/{ext}"),
                 size_bytes,
                 width: 1920,
                 height: 1080,
@@ -2096,7 +2075,7 @@ pub fn inspect_media_file<P: AsRef<Path>>(path: P) -> Result<MediaInspectionRepo
         }
         "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" => Ok(MediaInspectionReport {
             file_name,
-            format: format!("image/{}", ext),
+            format: format!("image/{ext}"),
             size_bytes,
             width: 1080,
             height: 1080,
@@ -2104,6 +2083,6 @@ pub fn inspect_media_file<P: AsRef<Path>>(path: P) -> Result<MediaInspectionRepo
             frame_count: 1,
             is_supported: true,
         }),
-        _ => Err(format!("Unsupported media format: .{}", ext)),
+        _ => Err(format!("Unsupported media format: .{ext}")),
     }
 }

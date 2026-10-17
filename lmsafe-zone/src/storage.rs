@@ -1,10 +1,10 @@
-use crate::model::ModelFamily;
 use serde::Serialize;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use sysinfo::Disks;
+use sysreflect_model::ModelFamily;
 use tracing::{debug, info, warn};
 
 static BASE_STORAGE_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -21,6 +21,7 @@ pub enum MediaFamily {
 }
 
 impl MediaFamily {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             MediaFamily::Video => "video",
@@ -28,6 +29,7 @@ impl MediaFamily {
         }
     }
 
+    #[must_use]
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
             "mp4" | "mov" | "m4v" | "avi" | "mkv" | "webm" => Some(MediaFamily::Video),
@@ -43,6 +45,13 @@ pub struct MediaInfo {
     pub size_bytes: u64,
 }
 
+/// Create the storage root and record it as the process-wide base path.
+///
+/// # Errors
+///
+/// * [`ErrorKind::AlreadyExists`](io::ErrorKind::AlreadyExists) if storage was
+///   already initialized in this process.
+/// * IO errors from creating the directory.
 #[tracing::instrument(skip_all, fields(base_path = %base_path.as_ref().display(), sandboxed))]
 pub fn init_storage<P: AsRef<Path>>(base_path: P, sandboxed: bool) -> io::Result<()> {
     let path = base_path.as_ref().to_path_buf();
@@ -56,18 +65,15 @@ pub fn init_storage<P: AsRef<Path>>(base_path: P, sandboxed: bool) -> io::Result
 
     SANDBOXED.set(sandboxed).ok();
 
-    match BASE_STORAGE_PATH.set(path.clone()) {
-        Ok(()) => {
-            debug!("Storage path set successfully");
-            Ok(())
-        }
-        Err(_) => {
-            warn!("Storage already initialized at: {}", path.display());
-            Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "Storage already initialized",
-            ))
-        }
+    if let Ok(()) = BASE_STORAGE_PATH.set(path.clone()) {
+        debug!("Storage path set successfully");
+        Ok(())
+    } else {
+        warn!("Storage already initialized at: {}", path.display());
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Storage already initialized",
+        ))
     }
 }
 
@@ -79,6 +85,11 @@ pub fn get_base_path() -> PathBuf {
     })
 }
 
+/// Resolve (and create) the model safe-zone directory for a family.
+///
+/// # Errors
+///
+/// IO errors from creating the directory.
 pub fn get_safe_zone_dir(family: ModelFamily) -> io::Result<PathBuf> {
     let mut path = get_base_path();
     path.push("models");
@@ -87,6 +98,11 @@ pub fn get_safe_zone_dir(family: ModelFamily) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Resolve (and create) the media safe-zone directory for a family.
+///
+/// # Errors
+///
+/// IO errors from creating the directory.
 pub fn get_media_safe_zone_dir(family: MediaFamily) -> io::Result<PathBuf> {
     let mut path = get_base_path();
     path.push("media");
@@ -95,7 +111,7 @@ pub fn get_media_safe_zone_dir(family: MediaFamily) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Checks if free disk space is sufficient to copy a file into SafeZone
+/// Checks if free disk space is sufficient to copy a file into `SafeZone`
 pub fn is_storage_safe_for_duplication<P: AsRef<Path>>(source_path: P, safety_margin: f64) -> bool {
     let source = source_path.as_ref();
     if !source.exists() || !source.is_file() {
@@ -107,6 +123,20 @@ pub fn is_storage_safe_for_duplication<P: AsRef<Path>>(source_path: P, safety_ma
         Err(_) => return false,
     };
 
+    // Same f64 margin arithmetic as `admission::assess_admission`; the two
+    // must agree on what "required space" means.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "margin is fractional, so the product must be f64"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "result truncates toward zero; matches the admission rule"
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "f64 -> u64 for a size; inputs are non-negative file sizes"
+    )]
     let required_space = (file_size as f64 * safety_margin) as u64;
 
     let base_dir = get_base_path();
@@ -116,19 +146,29 @@ pub fn is_storage_safe_for_duplication<P: AsRef<Path>>(source_path: P, safety_ma
     let available_space = disks
         .iter()
         .filter(|disk| base_dir.starts_with(disk.mount_point()))
-        .map(|disk| disk.available_space())
+        .map(sysinfo::Disk::available_space)
         .max()
         .unwrap_or_else(|| {
             // Fallback: Check first disk
             disks
                 .first()
-                .map(|d| d.available_space())
-                .unwrap_or(u64::MAX)
+                .map_or(u64::MAX, sysinfo::Disk::available_space)
         });
 
     available_space >= required_space
 }
 
+/// Copy a model file into the safe zone for its family.
+///
+/// # Errors
+///
+/// * [`ErrorKind::NotFound`](io::ErrorKind::NotFound) if the source is missing
+///   or not a regular file.
+/// * [`ErrorKind::OutOfMemory`](io::ErrorKind::OutOfMemory) when free disk space
+///   is below the required size plus safety margin.
+/// * [`ErrorKind::InvalidInput`](io::ErrorKind::InvalidInput) when the source
+///   has no usable file name.
+/// * IO errors from creating directories or copying the file.
 #[tracing::instrument(skip_all, fields(source_path = %source_path.as_ref().display(), family = ?family, safety_margin))]
 pub fn copy_to_safe_zone<P: AsRef<Path>>(
     source_path: P,
@@ -193,6 +233,17 @@ pub fn copy_to_safe_zone<P: AsRef<Path>>(
     }
 }
 
+/// Copy a media file into the safe zone for its family.
+///
+/// # Errors
+///
+/// * [`ErrorKind::NotFound`](io::ErrorKind::NotFound) if the source is missing
+///   or not a regular file.
+/// * [`ErrorKind::OutOfMemory`](io::ErrorKind::OutOfMemory) when free disk space
+///   is below the required size plus safety margin.
+/// * [`ErrorKind::InvalidInput`](io::ErrorKind::InvalidInput) when the source
+///   has no usable file name.
+/// * IO errors from creating directories or copying the file.
 pub fn copy_media_to_safe_zone<P: AsRef<Path>>(
     source_path: P,
     family: MediaFamily,
@@ -224,6 +275,11 @@ pub fn copy_media_to_safe_zone<P: AsRef<Path>>(
     Ok(dest_path)
 }
 
+/// Remove every stored model artifact for a family.
+///
+/// # Errors
+///
+/// IO errors from resolving the directory or deleting its contents.
 pub fn clean_safe_zone(family: ModelFamily) -> io::Result<()> {
     let dir = get_safe_zone_dir(family)?;
     // Also remove _model_path reference (path-only mode)
@@ -234,11 +290,21 @@ pub fn clean_safe_zone(family: ModelFamily) -> io::Result<()> {
     clean_directory(&dir)
 }
 
+/// Remove every stored media artifact for a family.
+///
+/// # Errors
+///
+/// IO errors from resolving the directory or deleting its contents.
 pub fn clean_media_safe_zone(family: MediaFamily) -> io::Result<()> {
     let dir = get_media_safe_zone_dir(family)?;
     clean_directory(&dir)
 }
 
+/// List the media files held in a family's safe zone.
+///
+/// # Errors
+///
+/// IO errors from resolving the directory or reading its entries.
 pub fn list_media_safe_zone(family: MediaFamily) -> io::Result<Vec<MediaInfo>> {
     let dir = get_media_safe_zone_dir(family)?;
     let mut files = Vec::new();
@@ -262,20 +328,25 @@ pub fn list_media_safe_zone(family: MediaFamily) -> io::Result<Vec<MediaInfo>> {
     Ok(files)
 }
 
+/// Delete a single media file from a family's safe zone.
+///
+/// # Errors
+///
+/// * [`ErrorKind::NotFound`](io::ErrorKind::NotFound) when the file is absent.
+/// * [`ErrorKind::InvalidInput`](io::ErrorKind::InvalidInput) when the name
+///   escapes the safe zone (path traversal).
+/// * IO errors from resolving or deleting the file.
 pub fn remove_media_from_safe_zone(family: MediaFamily, file_name: &str) -> io::Result<()> {
     let dir = get_media_safe_zone_dir(family)?;
     let target = dir.join(file_name);
 
     // Prevent path traversal: canonicalize both and ensure target is inside the dir
     let canonical_dir = fs::canonicalize(&dir).unwrap_or(dir.clone());
-    let canonical_target = match fs::canonicalize(&target) {
-        Ok(p) => p,
-        Err(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Media file not found in SafeZone",
-            ))
-        }
+    let Ok(canonical_target) = fs::canonicalize(&target) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Media file not found in SafeZone",
+        ));
     };
     if !canonical_target.starts_with(&canonical_dir) {
         return Err(io::Error::new(
@@ -314,25 +385,33 @@ fn clean_directory(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Return the first model stored for a family, or `None` if the zone is empty.
+///
+/// Prefers the `_model_path` reference (path-only mode on desktop) and falls
+/// back to scanning for a copied file (Android).
+///
+/// # Errors
+///
+/// IO errors from resolving the directory or reading its entries.
 pub fn get_first_stored_model(family: ModelFamily) -> io::Result<Option<PathBuf>> {
     let dir = get_safe_zone_dir(family)?;
     if dir.exists() {
         // Path-only mode (desktop/linux/macOS): check _model_path reference first
         let path_file = dir.join("_model_path");
-        if path_file.exists() {
-            if let Ok(path_str) = fs::read_to_string(&path_file) {
-                let model_path = PathBuf::from(path_str.trim());
-                if model_path.exists() {
-                    debug!("Found stored model path: {}", model_path.display());
-                    return Ok(Some(model_path));
-                }
-                warn!("Stored path no longer exists: {}", model_path.display());
+        if path_file.exists()
+            && let Ok(path_str) = fs::read_to_string(&path_file)
+        {
+            let model_path = PathBuf::from(path_str.trim());
+            if model_path.exists() {
+                debug!("Found stored model path: {}", model_path.display());
+                return Ok(Some(model_path));
             }
+            warn!("Stored path no longer exists: {}", model_path.display());
         }
         // Copy mode (Android): scan for actual model files
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
-            if path.is_file() && path.file_name().map(|n| n != "_model_path").unwrap_or(true) {
+            if path.is_file() && path.file_name().is_none_or(|n| n != "_model_path") {
                 return Ok(Some(path));
             }
         }

@@ -174,22 +174,37 @@ char* lmsafe_inspect_media_file(const char* path);
 
 The repository consists of:
 
-1. **`sysreflect-core` (Rust Library)**: The core native engine that performs model inspection, capability inference, system telemetry, and Safe Zone file orchestration (both Model and Media Safe Zones). All metadata is parsed locally from binary headers — no external APIs. Compiled as `libsysreflect_core.so`.
-2. **`lmsafe-ffi` (Rust FFI Layer)**: A dedicated C FFI wrapper around `sysreflect-core` that exposes a C-compatible interface (`lmsafe-ffi/lmsafe.h`) for foreign-language consumers. Compiled as `liblmsafe.so`.
-3. **`lmsafe-cli` & `lmsafe-tui` (Rust Tools)**: Command-line utilities for inspecting models and monitoring system resources, powered by `sysreflect-core`.
+1. **`sysreflect-core` (Rust Library)**: System reflection — the telemetry engine. CPU, memory, network, processes, host info. Compiled as `libsysreflect_core.so`.
+2. **`sysreflect-model` (Rust Library)**: Model & media reflection — magic-byte family detection, GGUF/GGML/LiteRT/safetensors parsing, capability inference. All metadata is parsed locally from binary headers — no external APIs.
+3. **`lmsafe-zone` (Rust Library)**: The Safe Zone — storage layout for Model and Media Safe Zones, plus the single admission rule (`is this model safe to load?`) that every front-end renders.
+4. **`lmsafe-ffi` (Rust FFI Layer)**: A dedicated C FFI wrapper that exposes a C-compatible interface (`lmsafe-ffi/lmsafe.h`) for foreign-language consumers. Compiled as `liblmsafe.so`.
+5. **`lmsafe-cli` & `lmsafe-tui` (Rust Tools)**: Command-line utilities for inspecting models and monitoring system resources.
+
+The dependency direction is one-way, with no cycles:
+
+```
+sysreflect-core ← sysreflect-model ← lmsafe-zone ← { lmsafe-ffi, lmsafe-cli, lmsafe-tui }
+```
+
+Safe Zone logic *depends on* reflection; reflection knows nothing about the Safe Zone.
 
 ---
 
 ## 🛠️ Implementation Details
 
-### 1. The sysreflect-core (Rust Engine)
+### 1. The three engines
 
-`sysreflect-core` is the brain of the operation. Instead of writing duplicate metadata parsers for every platform, it handles it natively in Rust. All metadata is extracted by parsing binary headers and JSON config files directly — zero network calls, zero external service dependencies.
+`sysreflect-core` is the eyes: it only answers *what is this host doing right now*, using `sysinfo` to track CPU, memory, and network usage (on Apple Silicon it goes through Mach so GPU/Metal pressure counts as used memory).
+
+`sysreflect-model` is the fingerprint reader. Instead of writing duplicate metadata parsers for every platform, it handles it natively in Rust. All metadata is extracted by parsing binary headers and JSON config files directly — zero network calls, zero external service dependencies.
 
 * **Model Inspection**: Parses magic bytes and metadata for Llama (GGUF), Whisper (GGML), LiteRT (TFLite), and Supertonic.
 * **Capability Inference**: Automatically determines what a model can do (e.g., `TextGeneration`, `Tools`, `Vision`, `SpeechToText`) based on its architecture and chat templates.
-* **Telemetry**: Uses `sysinfo` to track CPU, Memory, and Network usage.
-* **Memory Guard**: Calculates `file_size * safety_margin` against available system RAM to prevent Out-Of-Memory (OOM) crashes before they happen.
+
+`lmsafe-zone` is the gatekeeper, and it keeps exactly **one** admission rule (`lmsafe_zone::admission`) instead of one copy per front-end:
+
+* **Memory Guard**: Calculates `file_size * safety_margin` against available system RAM to prevent Out-Of-Memory (OOM) crashes before they happen. A zero-byte model is rejected, and unavailable telemetry yields `Unknown` — never a green light.
+* **Safe Zone Storage**: Per-family directories, copy-or-reference mode depending on OS sandboxing, media listing and traversal-safe removal.
 
 #### CLI & TUI
 * **`lmsafe-cli`**: Inspect any local model file and output its capabilities and metadata (JSON supported).

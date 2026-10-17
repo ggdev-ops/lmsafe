@@ -1,7 +1,67 @@
 [workspace]
 members = [
     "sysreflect-core",
+    "sysreflect-model",
+    "lmsafe-zone",
     "lmsafe-ffi",
     "lmsafe-tui", "lmsafe-cli",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+authors = ["ggdev-ops <ggdevnight@gmail.com>"]
+
+# description is deliberately NOT inherited: each crate describes itself.
+
+[workspace.dependencies]
+sysreflect-core = { path = "sysreflect-core" }
+sysreflect-model = { path = "sysreflect-model" }
+lmsafe-zone = { path = "lmsafe-zone" }
+
+# CLI Argument Parsing
+clap = { version = "4.6.7", features = ["derive"] }
+
+# Serialization and Data Parsing
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.10"
+
+# Terminal UI and Input Handling
+# crossterm must match the version ratatui 0.29 is built on (0.28.x);
+# two copies means two terminal-state machines in one binary.
+ratatui = "0.29"
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+
+# System Metrics and OS Interoperability
+libc = "0.2"
+sysinfo = "0.33.1"
+tracing = "0.1"
+
+# Error Reporting and Diagnostics
+color-eyre = "0.6.3"
+
+[profile.ggdev-ops]
+inherits = "dev"
+debug = "full"
+
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
+codegen-units = 1
+# unwinding must be possible so the FFI panic guard (ffi_guard) can
+# contain panics and return error JSON instead of aborting the host.
+# (Escapes past extern "C" still abort — the guard is the safety net.)
+overflow-checks = true
+
+[workspace.lints.rust]
+unused_imports = "deny"
+
+[workspace.lints.clippy]
+# Enforces all standard Clippy correctness rules
+all = { level = "deny", priority = -1 }
+# Catches complex, un-idiomatic code and suggests cleaner Rust syntax
+pedantic = { level = "warn", priority = -1 }

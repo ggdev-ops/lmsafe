@@ -1,0 +1,22 @@
+[package]
+name = "lmsafe-zone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Safe Zone storage plus the single admission rule for model loading"
+
+# The safe zone: storage layout for models/media plus the admission rule tha
+# decides whether a model fits in memory. Consumes sysreflect-core (telemetry)
+# and sysreflect-model (file identity).
+
+[dependencies]
+sysreflect-core.workspace = true
+sysreflect-model.workspace = true
+sysinfo.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
+
