@@ -137,6 +137,14 @@ copy and they had already disagreed (0-byte model, restricted telemetry).
 ## CI Pipeline (.github/workflows/ci.yml)
 check → test (ubuntu + macos) → clippy → fmt
 
+## Git Workflow (mandatory)
+- NEVER commit to `main`. Branch → push → Pull Request. `main` only moves via PR.
+- Name the branch after the work: `refactor/crate-split-and-lint-gate`.
+- PR body = what changed, a verification table, and the open decisions for review.
+- Keep the human's own edits (AGENTS.md lines 1-108) in their own commit so they
+  can be reviewed or dropped independently.
+- Move files with `git mv` so rename history survives.
+
 ## Before Every Commit
 1. cargo fmt --all
 2. cargo clippy --workspace -- -D warnings
