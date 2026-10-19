@@ -2,6 +2,8 @@
 
 `lmsafe` (Local Metaverse Safe) is an architecture designed to host, manage, inspect, and execute Local Models (LMs) within a secure, predictable, and self-disciplined environment. Everything is local — no internet connection required. The Shield reads binary headers directly.
 
+**Who this serves:** any local AI host, through the C FFI — language-agnostic by design, no consumer baked in. The shared vocabulary between Developer and User lives in [GLOSSARY.md](GLOSSARY.md); where this README and the glossary differ, the glossary wins.
+
 ---
 
 ## 🌌 The Shield Contract
@@ -67,7 +69,7 @@ On macOS and Linux, there are no OS-level restrictions. The Mirror Ball *could* 
 
 ## 🏔️ The Safe Zone
 
-The **Safe Zone** is a designated, isolated directory partition governed by the Shield contract. It guarantees that the native engine has direct, unhindered filesystem access — no internet connection required. The Shield reads everything it needs from local binary headers.
+The **Safe Zone** is a designated, isolated directory partition governed by the Shield contract — organized in **lanes**: a lane fixes what may live there, how it is gated (RAM for models, disk for media), and how it is inspected. Models and media ship today; lanes grow when a project needs one (documents, private storage). The zone is not tied to LLMs. It guarantees that the native engine has direct, unhindered filesystem access — no internet connection required. The Shield reads everything it needs from local binary headers.
 
 ### Model Safe Zone
 
@@ -96,6 +98,8 @@ At the code level: `isSafeToLoad(path, safetyMargin)`.
 | `Onnx` | ONNX | Directory structure + JSON config |
 | `AudioSegmentation` | GGML/ONNX | Filename + directory heuristics |
 | `SafeTensors` | SafeTensors | 8-byte header → JSON parse |
+
+> A **model family** is the engine format; a **container** is the file format. One model can ship in several containers — a llama can be GGUF or ONNX, and SafeTensors weights can live inside an ONNX. The Shield reads each container's own metadata (header, graph signature, flatbuffer) — never a filename.
 
 ### Media Safe Zone
 
