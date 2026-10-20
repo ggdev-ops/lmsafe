@@ -95,11 +95,13 @@ At the code level: `isSafeToLoad(path, safetyMargin)`.
 | `LlamaCpp` | GGUF | Binary header KV parser |
 | `WhisperCpp` | GGML | Field-by-field binary reader |
 | `LiteRtLm` | TFLite/TFL3 | FlatBuffers + Protobuf reader |
-| `Onnx` | ONNX | Directory structure + JSON config |
+| `Onnx` | ONNX | Protobuf graph-signature scan (inputs, outputs, initializer shapes — weights skipped by seek) |
 | `AudioSegmentation` | GGML/ONNX | Filename + directory heuristics |
 | `SafeTensors` | SafeTensors | 8-byte header → JSON parse |
 
 > A **model family** is the engine format; a **container** is the file format. One model can ship in several containers — a llama can be GGUF or ONNX, and SafeTensors weights can live inside an ONNX. The Shield reads each container's own metadata (header, graph signature, flatbuffer) — never a filename.
+
+An ONNX path is also a matter of **units**: one unit is one thing an engine loads together (a single `.onnx`, or a directory like `supertonic-3/onnx` holding several), and one path can be a group of units — `assets/` resolves to llm, stt, supertonic-3, translation/{marian, nllb} and vad, each with its own graph-derived classes, capabilities and load size. Admission for ONNX counts **container bytes only**: samples, docs and `.git` objects sit on disk but never load, so they never enter the math — the on-disk footprint is reported beside the loaded size instead. A directory with nothing model-shaped inside gets `UNKNOWN`, never a fabricated verdict.
 
 ### Media Safe Zone
 

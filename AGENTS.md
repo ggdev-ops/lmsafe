@@ -161,10 +161,21 @@ copy and they had already disagreed (0-byte model, restricted telemetry).
   on 0/0, so an idle machine prints "Access Denied". Idle is Available(0, 0).
 - Whisper display leaks raw fields: `ftype:1` should read `F16`; `Parameters: small`
   is a size class, not a count.
-- ONNX inspection trusts directory names; the graph-signature reader that works for
-  silero VAD is not generalized. Planned direction: container → graph signature →
-  model class (input_ids+logits+past_key_values = decoder-only LLM), package
-  context as supplementary evidence, never filename claims.
+
+## ONNX inspection (shipped 2026-10-18)
+Container → graph signature → model class; no filename claims. Every `.onnx`
+is scanned (weights skipped by seek) for graph inputs/outputs/initializer
+shapes. Classes: `decoder-only-lm`, `seq2seq-decoder`, `audio-encoder`,
+`text-encoder`, `vad`, `vocoder`, `tts-text-encoder`,
+`tts-duration-predictor`, `tts-estimator` — else an honest `unknown` plus the
+raw I/O. Units are discovered by walking the path (depth-bounded, dot-dirs
+skipped): one unit per package dir, groups recurse (`assets/` → llm, stt,
+supertonic-3, translation/{marian, nllb}, vad). Admission sizes by container
+bytes only (`onnx_load_bytes`); a directory with nothing model-shaped inside
+gets `UNKNOWN`, never a fabricated verdict. Ground truth:
+`Models/onnx/play_onnx/onnx_info.py`, verified against every real container
+including exact parameter counts. Field numbers verified against the
+installed onnx package descriptor — never from memory.
 
 ## CI Pipeline (.github/workflows/ci.yml)
 check → test (ubuntu + macos) → clippy → fmt

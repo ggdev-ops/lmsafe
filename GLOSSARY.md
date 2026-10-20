@@ -59,8 +59,19 @@ _Avoid_: buffer, padding
 
 **Container**:
 The file format a model ships in — GGUF, GGML, LiteRT-LM, ONNX, SafeTensors.
-One model can ship in several containers.
+One model can ship in several containers; one ONNX directory can hold several
+containers. An ONNX container is classified by its graph signature (inputs,
+outputs, initializer shapes) read straight from the protobuf — never by
+filename or directory name.
 _Avoid_: engine
+
+**Unit**:
+What an engine loads together and what one admission verdict describes: an
+ONNX path is one unit (a single `.onnx`, or a directory of them like
+`supertonic-3/onnx`) or a group of units (`assets/` → llm, stt,
+supertonic-3, translation/{marian, nllb}, vad). Discovered by walking the
+path for containers — not by names.
+_Avoid_: model folder, bundle
 
 **Model**:
 The network inside a container (llama, whisper, moonshine, supertonic),
