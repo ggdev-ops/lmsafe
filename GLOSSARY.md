@@ -16,7 +16,8 @@ is part of lmsafe's vocabulary.
 
 **Host**:
 The program that calls lmsafe through the FFI. Any host; lmsafe names and
-assumes none.
+assumes none. No consumer is repo content: a PR that brings a host's own
+code into lmsafe is rejected.
 _Avoid_: app, caller, engine
 
 **Inspector**:
