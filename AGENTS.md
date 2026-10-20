@@ -122,17 +122,62 @@
 - sysreflect-core   — System reflection: telemetry only (SystemMonitor, MetricStatus, format_bytes)
 - sysreflect-model  — Model & media reflection: family detection, GGUF/GGML/LiteRT/safetensors parsing, capability inference
 - lmsafe-zone       — Safe Zone: storage layout + the ONE admission rule (`lmsafe_zone::admission`)
-- lmsafe-ffi        — C FFI wrapper → liblmsafe.so
+- lmsafe-ffi        — C FFI wrapper → liblmsafe.{a,so,dylib}. Two names on purpose: cargo
+                      addresses the package (`cargo build -p lmsafe-ffi`), hosts link the
+                      artifact (`-llmsafe`). Nothing depends on it as a Rust lib — boundary leaf.
 - lmsafe-cli        — CLI tool. No args = one-shot telemetry snapshot; `inspect --file <FILE>` = model inspection (+ `--json`)
 - lmsafe-tui        — Terminal UI dashboard
 
 ## Dependency Direction (no cycles)
 sysreflect-core ← sysreflect-model ← lmsafe-zone ← {lmsafe-ffi, lmsafe-cli, lmsafe-tui}
 
+## Architecture (the chain a model travels)
+Host (any consumer via the C FFI — lmsafe names none) → SafeZone (lmsafe-zone) → Gates (RAM gate + copy gate) → Inspector (sysreflect-model + sysreflect-core).
+- The host loads only from the SafeZone; the gates protect the zone; the inspector
+  answers "what is this file?" and "what is the system doing?".
+- The SafeZone is lane-based: the lane (models, media, …) fixes the gate, the
+  inspection report shape, and the lifecycle ops. Lanes grow with need — the zone
+  is not tied to LLMs (a media lane with duration/dimensions/frame inspection
+  ships today).
+- lmsafe never runs models and takes no responsibility for engines. Containers are
+  inspected through their own metadata (GGUF header, ONNX graph signature, LiteRT
+  flatbuffer) — one model can ship in several containers (llama as GGUF or ONNX).
+- Vocabulary: `GLOSSARY.md` (repo root), written with the domain-modeling discipline.
+
 ## Admission Rule
 Ask `lmsafe_zone::admission` (assess_admission / assess_with_monitor / assess_model_path).
 Never re-derive "free RAM vs model_size * margin": core, CLI and TUI each carried a
 copy and they had already disagreed (0-byte model, restricted telemetry).
+
+## Scope
+- lmsafe is universal by design: any host, any language, through the C FFI — a
+  plain Rust workspace, independent of any consumer's toolchain.
+- It earns universality by serving the Developer's own projects right. Real use is
+  the proving ground; consumers are examples, never canon — no consumer is part of
+  lmsafe's identity, docs, or design.
+- Out of scope: VCS state (e.g. unfetched git-lfs pointers) — files are reported
+  exactly as found on disk. No code may special-case how bytes arrived.
+
+## Known gaps (reality-checked 2026-10-18 against real models on macOS; owed, not fixed)
+- Net metric mislabels idle as Restricted: `network_throughput` returns Restricted
+  on 0/0, so an idle machine prints "Access Denied". Idle is Available(0, 0).
+- Whisper display leaks raw fields: `ftype:1` should read `F16`; `Parameters: small`
+  is a size class, not a count.
+
+## ONNX inspection (shipped 2026-10-18)
+Container → graph signature → model class; no filename claims. Every `.onnx`
+is scanned (weights skipped by seek) for graph inputs/outputs/initializer
+shapes. Classes: `decoder-only-lm`, `seq2seq-decoder`, `audio-encoder`,
+`text-encoder`, `vad`, `vocoder`, `tts-text-encoder`,
+`tts-duration-predictor`, `tts-estimator` — else an honest `unknown` plus the
+raw I/O. Units are discovered by walking the path (depth-bounded, dot-dirs
+skipped): one unit per package dir, groups recurse (`assets/` → llm, stt,
+supertonic-3, translation/{marian, nllb}, vad). Admission sizes by container
+bytes only (`onnx_load_bytes`); a directory with nothing model-shaped inside
+gets `UNKNOWN`, never a fabricated verdict. Ground truth:
+`Models/onnx/play_onnx/onnx_info.py`, verified against every real container
+including exact parameter counts. Field numbers verified against the
+installed onnx package descriptor — never from memory.
 
 ## CI Pipeline (.github/workflows/ci.yml)
 check → test (ubuntu + macos) → clippy → fmt

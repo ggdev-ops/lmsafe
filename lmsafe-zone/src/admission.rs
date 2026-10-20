@@ -6,9 +6,12 @@
 //! asks this module and renders the answer.
 
 use serde::Serialize;
+use std::fs;
 use std::path::Path;
 use sysreflect_core::{MetricStatus, SystemMonitor, format_bytes};
-use sysreflect_model::{get_recursive_size, resolve_model_path};
+use sysreflect_model::{
+    ModelFamily, detect_model_family, get_recursive_size, onnx_load_bytes, resolve_model_path,
+};
 use tracing::{info, warn};
 
 /// Outcome of an admission check.
@@ -163,11 +166,63 @@ pub fn assess_with_monitor(
 }
 
 /// Resolve, size and assess a model path in one call.
-pub fn assess_model_path<P: AsRef<Path>>(path: P, safety_margin: f64) -> AdmissionReport {
+///
+/// The size that governs admission is the size that *loads*:
+/// - An ONNX path sizes by container bytes. A unit's samples, images and
+///   `.git` objects sit on disk but never enter an engine, so they never
+///   enter the math.
+/// - A directory of another recognized family sizes recursively (weights
+///   plus package files — hosts read those too).
+/// - A file always sizes by its own bytes: the host named it, and family
+///   detection by magic is best-effort.
+/// - A directory with nothing model-shaped inside gets no verdict at all —
+///   `Unknown`, never a fabricated green light for a folder of text files.
+pub fn assess_model_path_with_monitor<P: AsRef<Path>>(
+    monitor: &SystemMonitor,
+    path: P,
+    safety_margin: f64,
+) -> AdmissionReport {
     let resolved = resolve_model_path(&path);
-    let file_size = get_recursive_size(&resolved);
+    let Some(file_size) = model_load_bytes(&resolved) else {
+        let report = AdmissionReport {
+            verdict: Verdict::Unknown,
+            message: "No model found at path".to_string(),
+            file_size: 0,
+            required_bytes: 0,
+            available_memory: match monitor.memory_info() {
+                MetricStatus::Available((total, used)) => Some(total.saturating_sub(used)),
+                MetricStatus::Restricted | MetricStatus::Unavailable => None,
+            },
+            safety_margin: normalize_margin(safety_margin),
+        };
+        warn!("Admission UNKNOWN: {}", report.message);
+        return report;
+    };
+    assess_with_monitor(monitor, file_size, safety_margin)
+}
+
+/// Same, with a fresh monitor — for callers that only want the verdict.
+#[must_use]
+pub fn assess_model_path<P: AsRef<Path>>(path: P, safety_margin: f64) -> AdmissionReport {
     let monitor = SystemMonitor::new();
-    assess_with_monitor(&monitor, file_size, safety_margin)
+    assess_model_path_with_monitor(&monitor, path, safety_margin)
+}
+
+/// Bytes that loading this path puts in memory. `None` means nothing
+/// model-shaped is present. Exposed so consumers can show the same number
+/// the verdict was computed from.
+#[must_use]
+pub fn model_load_bytes(path: &Path) -> Option<u64> {
+    if path.is_file() {
+        return fs::metadata(path).ok().map(|m| m.len());
+    }
+    if let Some(bytes) = onnx_load_bytes(path) {
+        return Some(bytes);
+    }
+    match detect_model_family(path) {
+        ModelFamily::Unknown => None,
+        _ => Some(get_recursive_size(path)),
+    }
 }
 
 /// Boolean convenience for the C FFI. `Unknown` maps to `false`: a caller that
