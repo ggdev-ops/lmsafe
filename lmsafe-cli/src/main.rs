@@ -1,22 +1,25 @@
 use clap::Parser;
 use color_eyre::Result;
+use lmsafe_zone::Verdict;
+use lmsafe_zone::admission::{AdmissionReport, assess_with_monitor};
 use std::path::PathBuf;
-use sysreflect_core::model::{
-    get_recursive_size, inspect_model_file, resolve_model_path, ModelInspectionReport,
+use std::time::Duration;
+use sysreflect_core::{MetricStatus, ProcessInfo, SystemMonitor, format_bytes};
+use sysreflect_model::{
+    ModelInspectionReport, get_recursive_size, inspect_model_file, resolve_model_path,
 };
-use sysreflect_core::{MetricStatus, ProcessInfo, SystemMonitor};
 
 #[derive(Parser)]
 #[command(
     author,
     version,
     about = "CLI tool for lmsafe",
-    long_about = "CLI tool for lmsafe\n\nRequires a subcommand. model inspection always needs --file <FILE>.",
-    after_help = "Examples:\n  lmsafe-cli inspect --file <model path>\n  lmsafe-cli inspect --file <model path> --json\n  lmsafe-cli inspect --help"
+    long_about = "CLI tool for lmsafe\n\nWith no subcommand, prints a one-shot system telemetry snapshot (the headless equivalent of lmsafe-tui with no flags). Model inspection always needs --file <FILE>.",
+    after_help = "Examples:\n  lmsafe-cli\n  lmsafe-cli inspect --file <model path>\n  lmsafe-cli inspect --file <model path> --json\n  lmsafe-cli inspect --help"
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(clap::Subcommand)]
@@ -51,7 +54,7 @@ enum Commands {
 struct CliReport {
     model: Option<ModelInspectionReport>,
     system: SystemSnapshot,
-    verdict: VerdictInfo,
+    verdict: AdmissionReport,
 }
 
 #[derive(serde::Serialize)]
@@ -69,36 +72,6 @@ struct SystemSnapshot {
     network_rx: Option<u64>,
     network_tx: Option<u64>,
     top_processes: Vec<ProcessInfo>,
-}
-
-#[derive(serde::Serialize)]
-struct VerdictInfo {
-    status: String,
-    message: String,
-    model_name: Option<String>,
-    model_family: Option<String>,
-    quantization: Option<String>,
-    parameter_count: Option<String>,
-    file_size: u64,
-    required_bytes: u64,
-    available_memory: u64,
-    safety_margin: f64,
-}
-
-fn format_bytes(bytes: u64) -> String {
-    let kb = bytes as f64 / 1024.0;
-    let mb = kb / 1024.0;
-    let gb = mb / 1024.0;
-
-    if gb >= 1.0 {
-        format!("{:.2} GB", gb)
-    } else if mb >= 1.0 {
-        format!("{:.2} MB", mb)
-    } else if kb >= 1.0 {
-        format!("{:.2} KB", kb)
-    } else {
-        format!("{} B", bytes)
-    }
 }
 
 fn build_system_snapshot(sys: &SystemMonitor) -> SystemSnapshot {
@@ -144,59 +117,9 @@ fn build_system_snapshot(sys: &SystemMonitor) -> SystemSnapshot {
     }
 }
 
-fn build_verdict(
-    report: &Option<ModelInspectionReport>,
-    snapshot: &SystemSnapshot,
-    model_size: u64,
-    safety_margin: f64,
-) -> VerdictInfo {
-    let required_bytes = (model_size as f64 * safety_margin) as u64;
-
-    let (status, message, available_memory) = match (snapshot.memory_available, required_bytes) {
-        (Some(available), _) if available > required_bytes => (
-            "ACCEPTED".to_string(),
-            format!(
-                "Safe to load (Free RAM: {} > Required: {})",
-                format_bytes(available),
-                format_bytes(required_bytes)
-            ),
-            available,
-        ),
-        (Some(available), _) => (
-            "REJECTED".to_string(),
-            format!(
-                "OOM Risk (Free RAM: {} < Required: {})",
-                format_bytes(available),
-                format_bytes(required_bytes)
-            ),
-            available,
-        ),
-        _ => ("UNKNOWN".to_string(), "Telemetry Restricted".to_string(), 0),
-    };
-
-    VerdictInfo {
-        status,
-        message,
-        model_name: report.as_ref().map(|r| r.name.clone()),
-        model_family: report.as_ref().map(|r| format!("{:?}", r.family)),
-        quantization: report
-            .as_ref()
-            .and_then(|r| r.capabilities.quantization.clone()),
-        parameter_count: report
-            .as_ref()
-            .and_then(|r| r.capabilities.parameter_count.clone()),
-        file_size: model_size,
-        required_bytes,
-        available_memory,
-        safety_margin,
-    }
-}
-
-fn print_sysreflect(
-    report: &Option<ModelInspectionReport>,
-    snapshot: &SystemSnapshot,
-    verdict: &VerdictInfo,
-) {
+/// Print host, CPU and memory sections. Shared by both the moment snapshot
+/// and the `inspect` report so the two never drift apart.
+fn print_system_status(snapshot: &SystemSnapshot) {
     let w = 64;
 
     // Header
@@ -211,7 +134,7 @@ fn print_sysreflect(
     );
     match (snapshot.network_rx, snapshot.network_tx) {
         (Some(rx), Some(tx)) => {
-            println!("  Net RX: {} | TX: {}", format_bytes(rx), format_bytes(tx))
+            println!("  Net RX: {} | TX: {}", format_bytes(rx), format_bytes(tx));
         }
         _ => println!("  Net: Access Denied / N/A"),
     }
@@ -243,6 +166,13 @@ fn print_sysreflect(
         snapshot.memory_available,
     ) {
         (Some(total), Some(used), Some(avail)) => {
+            // A gauge, not an accounting figure: f64 error only matters past
+            // 2^53 bytes of RAM.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "memory gauge percentage; precision loss is unreachable \
+                          at realistic RAM sizes"
+            )]
             let pct = if total > 0 {
                 used as f64 / total as f64 * 100.0
             } else {
@@ -254,42 +184,47 @@ fn print_sysreflect(
         }
         _ => println!("  Memory: Access Denied / N/A"),
     }
+}
 
-    // Security Guard
+/// Print the admission-control verdict block. Only meaningful when a model
+/// file is in play, so the pure telemetry snapshot skips it entirely.
+fn print_guard(report: Option<&ModelInspectionReport>, verdict: &AdmissionReport) {
+    let w = 64;
+
     println!();
     println!("{}", "=".repeat(w));
     println!("{:^w$}", "Security Guard (Admission Control)", w = w);
     println!("{}", "=".repeat(w));
 
-    let verdict_icon = match verdict.status.as_str() {
-        "ACCEPTED" => "[OK]",
-        "REJECTED" => "[!!]",
-        _ => "[??]",
+    let (verdict_icon, verdict_label) = match verdict.verdict {
+        Verdict::Accepted => ("[OK]", "ACCEPTED"),
+        Verdict::Rejected => ("[!!]", "REJECTED"),
+        Verdict::Unknown => ("[??]", "UNKNOWN"),
     };
     println!(
         "  Verdict: {} {} - {}",
-        verdict_icon, verdict.status, verdict.message
+        verdict_icon, verdict_label, verdict.message
     );
 
-    if let Some(ref r) = report {
+    if let Some(r) = report {
         println!();
         println!("  Model Name:    {}", r.name);
         println!("  Family:        {:?}", r.family);
-        if r.family == sysreflect_core::model::ModelFamily::AudioSegmentation {
+        if r.family == sysreflect_model::ModelFamily::AudioSegmentation {
             let arch = r
                 .raw_metadata
                 .get("architecture")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Silero-RNN-v5");
-            println!("  Architecture:  {}", arch);
+            println!("  Architecture:  {arch}");
             println!("  Capabilities:  Audio/VAD, Streaming");
             println!("  Tensor Check:  Pass (Inputs: [audio, sr, state], Outputs: [prob, state])");
         } else {
             if let Some(ref q) = r.capabilities.quantization {
-                println!("  Quantization:  {}", q);
+                println!("  Quantization:  {q}");
             }
             if let Some(ref p) = r.capabilities.parameter_count {
-                println!("  Parameters:    {}", p);
+                println!("  Parameters:    {p}");
             }
             println!("  Inferred:      {:?}", r.inferred_capabilities);
 
@@ -305,28 +240,68 @@ fn print_sysreflect(
         println!("  File Size:     {}", format_bytes(verdict.file_size));
         println!("  Safety Margin: {:.2}x", verdict.safety_margin);
     }
+}
 
-    // Top Processes
-    if !snapshot.top_processes.is_empty() {
-        println!();
-        println!("{}", "-".repeat(w));
-        println!("{:^w$}", "Top Processes", w = w);
-        println!("{}", "-".repeat(w));
-        println!("  {:<8} {:<28} {:>6} {:>12}", "PID", "Name", "CPU%", "Mem");
-        println!("  {}", "-".repeat(w - 2));
-        for p in &snapshot.top_processes {
-            println!(
-                "  {:<8} {:<28} {:>5.1}% {:>11}",
-                p.pid,
-                truncate_str(&p.name, 28),
-                p.cpu_usage,
-                format_bytes(p.memory)
-            );
-        }
+fn print_processes(snapshot: &SystemSnapshot) {
+    if snapshot.top_processes.is_empty() {
+        return;
     }
 
+    let w = 64;
     println!();
-    println!("{}", "=".repeat(w));
+    println!("{}", "-".repeat(w));
+    println!("{:^w$}", "Top Processes", w = w);
+    println!("{}", "-".repeat(w));
+    println!("  {:<8} {:<28} {:>6} {:>12}", "PID", "Name", "CPU%", "Mem");
+    println!("  {}", "-".repeat(w - 2));
+    for p in &snapshot.top_processes {
+        println!(
+            "  {:<8} {:<28} {:>5.1}% {:>11}",
+            p.pid,
+            truncate_str(&p.name, 28),
+            p.cpu_usage,
+            format_bytes(p.memory)
+        );
+    }
+}
+
+fn print_sysreflect(
+    report: Option<&ModelInspectionReport>,
+    snapshot: &SystemSnapshot,
+    verdict: &AdmissionReport,
+) {
+    print_system_status(snapshot);
+    print_guard(report, verdict);
+    print_processes(snapshot);
+
+    println!();
+    println!("{}", "=".repeat(64));
+}
+
+/// One-shot telemetry snapshot: the headless mirror of `lmsafe-tui` with no
+/// flags. Same data, printed once, no model and no admission control.
+///
+/// CPU and network metrics are deltas between two samples, so a single
+/// refresh reports 0.0% and ~0 B. Take a warm-up sample, let a real interval
+/// pass, then sample again before printing.
+fn print_moment_snapshot() {
+    let mut sys = SystemMonitor::new();
+    sys.refresh();
+    std::thread::sleep(Duration::from_millis(300));
+    sys.refresh();
+
+    let snapshot = build_system_snapshot(&sys);
+    print_system_status(&snapshot);
+    print_processes(&snapshot);
+
+    println!();
+    println!("{}", "=".repeat(64));
+    println!(
+        "{:^w$}",
+        "Moment Snapshot (use lmsafe-tui to watch live)",
+        w = 64
+    );
+    println!("{}", "=".repeat(64));
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -342,11 +317,11 @@ fn format_uptime(secs: u64) -> String {
     let hours = (secs % 86400) / 3600;
     let mins = (secs % 3600) / 60;
     if days > 0 {
-        format!("{}d {}h {}m", days, hours, mins)
+        format!("{days}d {hours}h {mins}m")
     } else if hours > 0 {
-        format!("{}h {}m", hours, mins)
+        format!("{hours}h {mins}m")
     } else {
-        format!("{}m", mins)
+        format!("{mins}m")
     }
 }
 
@@ -355,11 +330,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Inspect {
+        Some(Commands::Inspect {
             file,
             json,
             safety_margin,
-        } => {
+        }) => {
             if !file.exists() {
                 eprintln!("Error: Model file does not exist: {}", file.display());
                 std::process::exit(1);
@@ -373,7 +348,8 @@ fn main() -> Result<()> {
             sys.refresh();
 
             let snapshot = build_system_snapshot(&sys);
-            let verdict = build_verdict(&report, &snapshot, model_size, safety_margin);
+            // One rule, owned by lmsafe-zone. The TUI renders this same report.
+            let verdict = assess_with_monitor(&sys, model_size, safety_margin);
 
             if json {
                 let cli_report = CliReport {
@@ -383,9 +359,10 @@ fn main() -> Result<()> {
                 };
                 println!("{}", serde_json::to_string_pretty(&cli_report)?);
             } else {
-                print_sysreflect(&report, &snapshot, &verdict);
+                print_sysreflect(report.as_ref(), &snapshot, &verdict);
             }
         }
+        None => print_moment_snapshot(),
     }
 
     Ok(())

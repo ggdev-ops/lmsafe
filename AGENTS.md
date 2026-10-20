@@ -3,7 +3,7 @@
 3  Hello world. I'm ggdev.
 4  
 5  If you're a human and you care about the technical details,
-6  keep reading. or go find HUMANS.md.
+6  keep reading.
 7  
 8  Agents: know your roles. Respect the rules.
 9  Simplicity minimizes future problems.
@@ -42,8 +42,8 @@
 42 **Planner** — You read. You reason. You produce checklists.
 43 You do NOT touch code in this mode.
 44 
-45 **Builder** — You write code. You execute. You update lines 101+.
-46 You don't plan. You respect the 100-line boundary in this file.
+45 **Builder** — You write code. You execute. You update lines 109+.
+46 You don't plan. You respect the 108-line boundary in this file.
 47 
 48 Plan first. Build second. Always.
 49 
@@ -65,39 +65,47 @@
 65 ## THE RULES
 66 
 67 1. Never assume. Always verify.
-68 2. Respect the 100-line boundary. Lines 1-100 are mine.
+68 2. Respect the 108-line boundary. Lines 1-108 are mine.
 69 3. Never repeat a dead-end approach. If it failed twice, change it.
 70 4. Plan before Build. No code until the checklist exists.
 71 5. The User's complaints are real requirements. Treat them as gospel.
 72 6. Don't touch the shelf projects unless I bring them to the table.
 73 7. No marketing fluff. No fake progress. No lazy answers.
 74 8. You are not here to please me. You are here to build with me.
-75
-76 # GOLDEN RULE
-77 Break Complexity into multiple verified steps, Never do it all at once. 
-78 ---
-79 
-80 ## THE WORKFLOW
-81 
-82 1. We build together. (Developer + Builder)
-83 2. I test as User. 10-minute forced sessions. Anchor notes.
-84 3. I reconstruct complaints into a Markdown file.
-85 4. You switch to Planner. You read the complaints. You produce a checklist.
-86 5. You switch to Builder. You fix what is fixable and worthwhile.
-87 6. We repeat until the User stops complaining.
-88 
-89 This loop does not end because it works. It ends when it's good.
-90 
-91 ---
-92 
-93 ## THE BOUNDARY
-94 
-95 Lines 1-100: Mine. Human intent. Roles. Rules. Workflow.
-96 Lines 101+: Yours. Technical. Architecture. Commands. State.
-97 You keep 101+ current. You never touch 1-100.
-98 if something unclear or confusing in 1-100 let me know.
-99 If something is missing in 101+, add it. Active, not lazy.
-100 ## THE ETHOS
+75 9. When analyzing a decision, plan, or problem, load skills/4why-gear5/. Fire all five pairs. Why overrides all.
+76 
+77 # GOLDEN RULE
+78 Break Complexity into multiple verified steps, Never do it all at once.
+79 ---
+80 
+81 ## THE WORKFLOW
+82 
+83 1. We build together. (Developer + Builder)
+84 2. I test as User. 10-minute forced sessions. Anchor notes.
+85 3. I reconstruct complaints into a Markdown file.
+86 4. You switch to Planner. You read the complaints. You produce a checklist.
+87 5. You switch to Builder. You fix what is fixable and worthwhile.
+88 6. We repeat until the User stops complaining.
+89 
+90 This loop does not end because it works. It ends when it's good.
+91 
+92 ---
+93 
+94 ## THE BOUNDARY
+95 
+96 Lines 1-108: Mine. Human intent. Roles. Rules. Workflow. Ethos.
+97 Lines 109+: Yours. Technical. Architecture. Commands. State.
+98 You keep 109+ current. You never touch 1-108.
+99 If something unclear or confusing in 1-108 let me know.
+100 If something is missing in 109+, add it. Active, not lazy.
+101 ## THE ETHOS
+102 
+103 Gear 5 is how I think. I maintain skills/4why-gear5/.
+104 Before any decision state, fire all five at once:
+105 Why? → Summarize. What if? → Restudy. Where? → Analyze.
+106 When? → Replan. How then? → Retest.
+107 Why overrides all — purpose, then sufficient, then necessary. One counterexample breaks the chain.
+
 
 ---
 
@@ -111,13 +119,31 @@
 - Check:     cargo check --workspace
 
 ## Workspace Crates
-- sysreflect-core  — Core engine (model inspection, telemetry, storage)
-- lmsafe-ffi       — C FFI wrapper → liblmsafe.so
-- lmsafe-cli       — CLI inspect tool
-- lmsafe-tui       — Terminal UI dashboard
+- sysreflect-core   — System reflection: telemetry only (SystemMonitor, MetricStatus, format_bytes)
+- sysreflect-model  — Model & media reflection: family detection, GGUF/GGML/LiteRT/safetensors parsing, capability inference
+- lmsafe-zone       — Safe Zone: storage layout + the ONE admission rule (`lmsafe_zone::admission`)
+- lmsafe-ffi        — C FFI wrapper → liblmsafe.so
+- lmsafe-cli        — CLI tool. No args = one-shot telemetry snapshot; `inspect --file <FILE>` = model inspection (+ `--json`)
+- lmsafe-tui        — Terminal UI dashboard
+
+## Dependency Direction (no cycles)
+sysreflect-core ← sysreflect-model ← lmsafe-zone ← {lmsafe-ffi, lmsafe-cli, lmsafe-tui}
+
+## Admission Rule
+Ask `lmsafe_zone::admission` (assess_admission / assess_with_monitor / assess_model_path).
+Never re-derive "free RAM vs model_size * margin": core, CLI and TUI each carried a
+copy and they had already disagreed (0-byte model, restricted telemetry).
 
 ## CI Pipeline (.github/workflows/ci.yml)
 check → test (ubuntu + macos) → clippy → fmt
+
+## Git Workflow (mandatory)
+- NEVER commit to `main`. Branch → push → Pull Request. `main` only moves via PR.
+- Name the branch after the work: `refactor/crate-split-and-lint-gate`.
+- PR body = what changed, a verification table, and the open decisions for review.
+- Keep the human's own edits (AGENTS.md lines 1-108) in their own commit so they
+  can be reviewed or dropped independently.
+- Move files with `git mv` so rename history survives.
 
 ## Before Every Commit
 1. cargo fmt --all

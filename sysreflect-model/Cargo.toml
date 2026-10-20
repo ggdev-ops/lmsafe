@@ -1,0 +1,20 @@
+[package]
+name = "sysreflect-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Model and media reflection: family detection, binary-header parsing, capability inference"
+
+# Model + media reflection: what is this file, what can it do, how big is it.
+# Knows nothing about the host system and nothing about the safe zone.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
+

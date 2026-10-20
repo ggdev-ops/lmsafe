@@ -1,9 +1,32 @@
-pub mod model;
-pub mod storage;
-
 use serde::Serialize;
 use sysinfo::{Components, Disks, Networks, System};
 use tracing::{debug, info, warn};
+
+/// Human-readable byte count (KB / MB / GB). Shared by every lmsafe binary so
+/// the same number is always spelled the same way.
+#[must_use]
+pub fn format_bytes(bytes: u64) -> String {
+    // Precision loss only appears above 2^53 bytes (~9 PB), far beyond any
+    // host this reads; the two-decimal output cannot show the difference.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte counts are converted to f64 for unit division; \
+                  precision loss starts at ~9 PB"
+    )]
+    let kb = bytes as f64 / 1024.0;
+    let mb = kb / 1024.0;
+    let gb = mb / 1024.0;
+
+    if gb >= 1.0 {
+        format!("{gb:.2} GB")
+    } else if mb >= 1.0 {
+        format!("{mb:.2} MB")
+    } else if kb >= 1.0 {
+        format!("{kb:.2} KB")
+    } else {
+        format!("{bytes} B")
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // macOS / Apple-Silicon unified-memory helper
@@ -45,7 +68,7 @@ mod macos_unified_mem {
         _reserved: [u32; 14],
     }
 
-    extern "C" {
+    unsafe extern "C" {
         fn mach_host_self() -> libc::c_uint;
         fn host_statistics64(
             host_priv: libc::c_uint,
@@ -67,7 +90,7 @@ mod macos_unified_mem {
     const HOST_VM_INFO64_COUNT: libc::c_uint = 38; // We only read the first 38 u32s (152 bytes)
 
     /// Returns the true physical RAM in bytes via `sysctl hw.memsize`.
-    /// This is what fastfetch / system_profiler report — the actual installed memory,
+    /// This is what fastfetch / `system_profiler` report — the actual installed memory,
     /// not the sum of page states which can undercount on Apple Silicon.
     fn physical_memory_bytes() -> Option<u64> {
         unsafe {
@@ -76,8 +99,8 @@ mod macos_unified_mem {
             let mut len = std::mem::size_of::<u64>();
             let rc = sysctlbyname(
                 name,
-                &mut size as *mut u64 as *mut libc::c_void,
-                &mut len,
+                (&raw mut size).cast::<libc::c_void>(),
+                &raw mut len,
                 std::ptr::null_mut(),
                 0,
             );
@@ -90,7 +113,7 @@ mod macos_unified_mem {
 
     /// Returns `(total_bytes, used_bytes)` via the Mach kernel interface.
     /// `total` uses `sysctl hw.memsize` (true physical RAM).
-    /// `used` = total − (free + inactive + speculative) pages × page_size.
+    /// `used` = total − (free + inactive + speculative) pages × `page_size`.
     ///
     /// On macOS, "inactive" pages are recently-used pages that are reclaimable
     /// but not yet freed. Activity Monitor / fastfetch count them as available.
@@ -104,7 +127,7 @@ mod macos_unified_mem {
 
             // Query page size.
             let mut page_size: libc::vm_size_t = 0;
-            if host_page_size(host, &mut page_size) != 0 || page_size == 0 {
+            if host_page_size(host, &raw mut page_size) != 0 || page_size == 0 {
                 return None;
             }
 
@@ -114,8 +137,8 @@ mod macos_unified_mem {
             let kern_return = host_statistics64(
                 host,
                 HOST_VM_INFO64,
-                stats_uninit.as_mut_ptr() as *mut libc::c_int,
-                &mut count,
+                stats_uninit.as_mut_ptr().cast::<libc::c_int>(),
+                &raw mut count,
             );
             if kern_return != 0 {
                 return None;
@@ -125,9 +148,9 @@ mod macos_unified_mem {
             // "Available" pages on macOS = free + inactive + speculative.
             // Inactive pages are reclaimable but not yet freed; they count as
             // available in Activity Monitor and fastfetch.
-            let available_pages = stats.free_count as u64
-                + stats.inactive_count as u64
-                + stats.speculative_count as u64;
+            let available_pages = u64::from(stats.free_count)
+                + u64::from(stats.inactive_count)
+                + u64::from(stats.speculative_count);
             let ps = page_size as u64;
             let used = total.saturating_sub(available_pages * ps);
 
@@ -194,6 +217,7 @@ impl SystemMonitor {
         self.disks.refresh(true);
     }
 
+    #[must_use]
     pub fn global_cpu_usage(&self) -> MetricStatus<f32> {
         let usage = self.sys.global_cpu_usage();
         MetricStatus::Available(usage)
@@ -225,17 +249,17 @@ impl SystemMonitor {
         }
     }
 
+    #[must_use]
     pub fn core_count(&self) -> usize {
         let count = self.sys.cpus().len();
         if count == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(0)
+            std::thread::available_parallelism().map_or(0, std::num::NonZero::get)
         } else {
             count
         }
     }
 
+    #[must_use]
     pub fn host_info(&self) -> (String, String, String, u64) {
         let os_name = System::name().unwrap_or_default();
         let os_version = System::os_version().unwrap_or_else(|| "Unknown".to_string());
@@ -248,7 +272,7 @@ impl SystemMonitor {
             } else {
                 &os_name
             };
-            format!("{} {}", display_name, os_version)
+            format!("{display_name} {os_version}")
         };
         (
             System::host_name().unwrap_or_else(|| "Unknown".to_string()),
@@ -258,14 +282,15 @@ impl SystemMonitor {
         )
     }
 
+    #[must_use]
     pub fn cpu_brand(&self) -> String {
         self.sys
             .cpus()
             .first()
-            .map(|cpu| cpu.brand().to_string())
-            .unwrap_or_else(|| "Unknown".to_string())
+            .map_or_else(|| "Unknown".to_string(), |cpu| cpu.brand().to_string())
     }
 
+    #[must_use]
     pub fn top_processes_by_cpu(&self, limit: usize) -> MetricStatus<Vec<ProcessInfo>> {
         let procs = self.sys.processes();
         if procs.is_empty() {
@@ -293,6 +318,7 @@ impl SystemMonitor {
         MetricStatus::Available(list)
     }
 
+    #[must_use]
     pub fn network_throughput(&self) -> MetricStatus<(u64, u64)> {
         let mut rx = 0;
         let mut tx = 0;
