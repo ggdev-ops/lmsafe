@@ -7,6 +7,12 @@ authors.workspace = true
 description = "C FFI bindings for lmsafe (liblmsafe.so)"
 
 [lib]
+# Two names, two domains, on purpose:
+#   cargo speaks the PACKAGE name   -> cargo build -p lmsafe-ffi
+#   the world speaks the LIB name   -> link -llmsafe, ship liblmsafe.{a,so}
+# The artifact is the product ("lmsafe"); the package is workspace
+# bookkeeping. Nothing in the workspace depends on this crate as a Rust
+# library — it is the boundary leaf — so only the artifact name is public.
 name = "lmsafe"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
