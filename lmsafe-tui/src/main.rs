@@ -6,7 +6,9 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use lmsafe_zone::Verdict;
-use lmsafe_zone::admission::assess_with_monitor;
+use lmsafe_zone::admission::{
+    assess_model_path_with_monitor, assess_with_monitor, model_load_bytes,
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -20,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use sysreflect_core::{MetricStatus, SystemMonitor, format_bytes};
-use sysreflect_model::{ModelInspectionReport, get_recursive_size, inspect_model_file};
+use sysreflect_model::{ModelInspectionReport, inspect_model_file};
 
 #[derive(Parser)]
 #[command(
@@ -44,7 +46,8 @@ struct App {
     cpu_history: Vec<u64>,
     model_report: Option<ModelInspectionReport>,
     model_path: Option<PathBuf>,
-    model_size: u64,
+    /// Bytes the verdict math uses (containers load), computed once.
+    model_load_bytes: u64,
     safety_margin: f64,
 }
 
@@ -53,14 +56,17 @@ impl App {
         let model_report = model_path
             .as_ref()
             .and_then(|path| inspect_model_file(path).ok());
-        let model_size = model_path.as_ref().map_or(0, get_recursive_size);
+        let model_load_bytes = model_path
+            .as_deref()
+            .and_then(model_load_bytes)
+            .unwrap_or(0);
 
         Self {
             monitor: SystemMonitor::new(),
             cpu_history: Vec::with_capacity(100),
             model_report,
             model_path,
-            model_size,
+            model_load_bytes,
             safety_margin,
         }
     }
@@ -536,7 +542,7 @@ fn silero_detail_lines(
     ));
     lines.push(ratatui::text::Line::from(format!(
         "  File Size: {}",
-        format_bytes(app.model_size)
+        format_bytes(app.model_load_bytes)
     )));
     lines.push(ratatui::text::Line::from(format!(
         "  Safety Margin: {:.2}x",
@@ -574,7 +580,7 @@ fn generic_detail_lines(
     )));
     lines.push(ratatui::text::Line::from(format!(
         "  File Size: {}",
-        format_bytes(app.model_size)
+        format_bytes(app.model_load_bytes)
     )));
     lines.push(ratatui::text::Line::from(format!(
         "  Safety Margin: {:.2}x",
@@ -612,7 +618,10 @@ fn generic_detail_lines(
 
 fn render_security_guard(f: &mut ratatui::Frame, app: &App, area: Rect) {
     // The verdict comes from lmsafe-zone — the same rule the CLI prints.
-    let admission = assess_with_monitor(&app.monitor, app.model_size, app.safety_margin);
+    let admission = app.model_path.as_ref().map_or_else(
+        || assess_with_monitor(&app.monitor, 0, app.safety_margin),
+        |path| assess_model_path_with_monitor(&app.monitor, path, app.safety_margin),
+    );
 
     let (verdict_text, verdict_style) = match admission.verdict {
         Verdict::Accepted => (
@@ -764,13 +773,13 @@ mod tests {
         }
     }
 
-    fn app_with(model_report: Option<ModelInspectionReport>, model_size: u64) -> App {
+    fn app_with(model_report: Option<ModelInspectionReport>, model_load_bytes: u64) -> App {
         App {
             monitor: SystemMonitor::new(),
             cpu_history: Vec::new(),
             model_report,
             model_path: Some(PathBuf::from("/models/test.gguf")),
-            model_size,
+            model_load_bytes,
             safety_margin: 1.15,
         }
     }

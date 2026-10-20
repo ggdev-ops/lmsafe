@@ -1,10 +1,12 @@
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use tracing::{debug, error, info, warn};
+
+pub mod onnx_graph;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ModelFamily {
@@ -208,6 +210,15 @@ fn probe_directory_family(path: &Path) -> Option<ModelFamily> {
     if dir_has_extension(path, "safetensors") {
         debug!("Found .safetensors file in directory - detected as SafeTensors");
         return Some(ModelFamily::SafeTensors);
+    }
+
+    // A directory whose containers are nested (group directories like
+    // `assets/`, or a unit holding them under `onnx/`) is still ONNX.
+    let mut containers = Vec::new();
+    collect_onnx_containers(path, 0, &mut containers);
+    if !containers.is_empty() {
+        debug!("Found .onnx containers recursively - detected as ONNX");
+        return Some(ModelFamily::Onnx);
     }
 
     debug!("No recognized model files found in directory");
@@ -1282,258 +1293,516 @@ fn parse_whisper_ggml<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectio
     })
 }
 
-/// Infer ONNX capabilities from a model's name. Both the directory path and
-/// the single-file path need this; they previously carried identical copies.
-fn onnx_capabilities_from_name(name: &str) -> Vec<Capability> {
-    let lower = name.to_lowercase();
+// ==========================================
+// ONNX: container → graph signature → model class
+// ==========================================
+//
+// ONNX is a container family, not a model: one application can hold a TTS
+// unit (supertonic) and an STT unit (moonshine) side by side. A *unit* is
+// what an engine loads together — one container (llm/model.onnx) or a
+// directory of them (supertonic-3/onnx/*.onnx). Units are discovered from
+// the path, classified from graph signatures alone (never filenames), and
+// assessed independently.
+
+/// Depth limit for container discovery. Real layouts nest at most two levels
+/// below a group directory (assets/supertonic-3/onnx/x.onnx = 2).
+const ONNX_MAX_WALK_DEPTH: u32 = 4;
+
+/// Collect every `.onnx` container under `dir`, sorted, skipping dot-dirs
+/// (`.git`, `.venv`) and staying within the depth budget.
+fn collect_onnx_containers(dir: &Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+    if depth > ONNX_MAX_WALK_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
+        let hidden = p
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if hidden {
+            continue;
+        }
+        if p.is_dir() {
+            collect_onnx_containers(&p, depth + 1, out);
+        } else if p.extension().is_some_and(|e| e == "onnx") {
+            out.push(p);
+        }
+    }
+}
+
+/// Bytes an engine would load for an ONNX path: the container files only.
+/// Samples, images, `.git` objects and docs are on disk but never loaded —
+/// they do not belong in admission math. `None` when the path holds no
+/// ONNX container at all.
+#[must_use]
+pub fn onnx_load_bytes<P: AsRef<Path>>(path: P) -> Option<u64> {
+    let path = path.as_ref();
+    if path.is_file() {
+        return if path.extension().is_some_and(|e| e == "onnx") {
+            fs::metadata(path).ok().map(|m| m.len())
+        } else {
+            None
+        };
+    }
+    let mut containers = Vec::new();
+    collect_onnx_containers(path, 0, &mut containers);
+    if containers.is_empty() {
+        return None;
+    }
+    Some(
+        containers
+            .iter()
+            .map(|c| fs::metadata(c).map_or(0, |m| m.len()))
+            .sum(),
+    )
+}
+
+fn push_unique(caps: &mut Vec<Capability>, c: Capability) {
+    if !caps.contains(&c) {
+        caps.push(c);
+    }
+}
+
+/// Unit-level capabilities composed from the container classes. A speech
+/// unit is an audio encoder *plus* a seq2seq decoder; a TTS unit is a text
+/// pipeline *plus* a vocoder. A lone seq2seq decoder claims nothing — the
+/// task (translation vs speech) is not in the graph.
+fn compose_onnx_capabilities(classes: &[onnx_graph::OnnxModelClass]) -> Vec<Capability> {
+    use onnx_graph::OnnxModelClass as C;
+    let has = |c: C| classes.contains(&c);
     let mut caps = Vec::new();
-    if lower.contains("decoder") || lower.contains("encoder") || lower.contains("llm") {
-        caps.push(Capability::TextGeneration);
+    if has(C::DecoderOnlyLm) {
+        push_unique(&mut caps, Capability::TextGeneration);
     }
-    if lower.contains("whisper") || lower.contains("stt") || lower.contains("moonshine") {
-        caps.push(Capability::SpeechToText);
-        caps.push(Capability::AudioInput);
+    if has(C::AudioEncoder) {
+        push_unique(&mut caps, Capability::AudioInput);
+        if has(C::Seq2SeqDecoder) {
+            push_unique(&mut caps, Capability::SpeechToText);
+        }
     }
-    if lower.contains("tts") || lower.contains("speech") || lower.contains("vocoder") {
-        caps.push(Capability::TextToSpeech);
-        caps.push(Capability::AudioOutput);
+    if has(C::Vad) {
+        push_unique(&mut caps, Capability::AudioInput);
     }
-    if lower.contains("vad") || lower.contains("silero") {
-        caps.push(Capability::AudioInput);
+    if has(C::Vocoder) {
+        push_unique(&mut caps, Capability::AudioOutput);
+        if has(C::TextEncoder) {
+            push_unique(&mut caps, Capability::TextToSpeech);
+        }
     }
     caps
 }
 
-/// Read an ONNX model's metadata. The body mixes three concerns — directory
-/// layout probing, protobuf scanning, and capability inference — which is why
-/// it exceeds the line limit. Splitting it safely needs parser tests that do
-/// not exist yet; see `tests/model.rs` (it currently covers family detection
-/// only). Keep this marker until those tests land.
-#[expect(
-    clippy::too_many_lines,
-    reason = "single-pass ONNX reader; splitting it requires parser tests first"
-)]
-fn parse_onnx<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport> {
-    let dir = path.as_ref();
-    let path_ref = path.as_ref();
-    let filename = path_ref.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let is_silero_vad =
-        filename.to_lowercase().contains("silero") || filename.to_lowercase().contains("vad");
-
-    let mut model_name = "Generic ONNX Model".to_string();
-    let mut version = "1.0".to_string();
-    let mut author = "Unknown ONNX Developer".to_string();
-    let mut inferred_capabilities = Vec::new();
-    let mut raw = HashMap::new();
-
-    // Check directory structure for Supertonic (onnx model subset) layouts
-    if dir.is_dir() {
-        if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
-            model_name = name.to_string();
-        }
-
-        let config_path = dir.join("config.json");
-        let tts_path = dir.join("onnx/tts.json");
-        let styles_path = dir.join("voice_styles");
-        let audio_path = dir.join("audio_samples");
-
-        let mut sample_rate = 0;
-        let mut tts_version = "unknown".to_string();
-        let mut split = "unknown".to_string();
-        let mut available_styles = Vec::new();
-        let mut audio_samples = Vec::new();
-        let mut is_supertonic_layout = false;
-
-        if tts_path.exists() {
-            is_supertonic_layout = true;
-            let content = fs::read_to_string(&tts_path)?;
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content) {
-                if let Some(ae) = map.get("ae").and_then(|v| v.as_object()) {
-                    sample_rate = ae
-                        .get("sample_rate")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(0);
-                }
-                if let Some(v) = map.get("tts_version").and_then(|v| v.as_str()) {
-                    tts_version = v.to_string();
-                }
-                if let Some(s) = map.get("split").and_then(|v| v.as_str()) {
-                    split = s.to_string();
-                }
-                if let Some(n) = map.get("model_name").and_then(|v| v.as_str()) {
-                    model_name = n.to_string();
-                }
-            }
-        }
-
-        if config_path.exists() {
-            let content = fs::read_to_string(&config_path)?;
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content)
-                && let Some(n) = map.get("model_name").and_then(|v| v.as_str())
-            {
-                model_name = n.to_string();
-            }
-        }
-
-        if styles_path.is_dir()
-            && let Ok(entries) = fs::read_dir(styles_path)
-        {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().is_some_and(|e| e == "json")
-                    && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
-                {
-                    available_styles.push(stem.to_string());
-                }
-            }
-        }
-
-        if audio_path.is_dir()
-            && let Ok(entries) = fs::read_dir(audio_path)
-        {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().is_some_and(|e| e == "wav" || e == "mp3")
-                    && let Some(name) = p.file_name().and_then(|n| n.to_str())
-                {
-                    audio_samples.push(name.to_string());
-                }
-            }
-        }
-
-        available_styles.sort();
-        audio_samples.sort();
-
-        if is_supertonic_layout {
-            author = "Supertonic AI".to_string();
-            version = tts_version;
-            inferred_capabilities.push(Capability::TextToSpeech);
-            inferred_capabilities.push(Capability::AudioOutput);
-
-            raw.insert("split".to_string(), Value::String(split));
-            raw.insert("sample_rate".to_string(), Value::Number(sample_rate.into()));
-            raw.insert(
-                "available_styles".to_string(),
-                Value::Array(available_styles.into_iter().map(Value::String).collect()),
-            );
-            raw.insert(
-                "audio_samples".to_string(),
-                Value::Array(audio_samples.into_iter().map(Value::String).collect()),
-            );
-        } else {
-            // General directory scan fallback
-            inferred_capabilities = onnx_capabilities_from_name(&model_name);
-        }
+/// Whole-number parameter formatting: `20_153_268` → "20.1M".
+fn format_parameter_count(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!(
+            "{}.{:01}B",
+            n / 1_000_000_000,
+            (n % 1_000_000_000) / 100_000_000
+        )
+    } else if n >= 1_000_000 {
+        format!("{}.{:01}M", n / 1_000_000, (n % 1_000_000) / 100_000)
+    } else if n >= 1_000 {
+        format!("{}.{:01}K", n / 1_000, (n % 1_000) / 100)
     } else {
-        // Single flat file parsing
-        if let Some(stem) = dir.file_stem().and_then(|s| s.to_str()) {
-            model_name = stem.to_string();
-        }
+        format!("{n}")
+    }
+}
 
-        inferred_capabilities = onnx_capabilities_from_name(&model_name);
+fn onnx_tensor_value(t: &onnx_graph::OnnxTensor) -> Value {
+    json!({
+        "name": t.name,
+        "dtype": serde_json::to_value(t.dtype).unwrap_or(Value::Null),
+        "dims": t
+            .dims
+            .iter()
+            .map(|d| match d {
+                onnx_graph::OnnxDim::Value(v) => json!(v),
+                onnx_graph::OnnxDim::Param(p) => json!(p),
+                onnx_graph::OnnxDim::Unknown => json!("?"),
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Package evidence: what the surrounding files *say* — supplementary by
+/// design. It can name a unit; it never grants a capability.
+fn read_package_evidence(root: &Path) -> HashMap<String, Value> {
+    let mut pkg = HashMap::new();
+
+    if let Ok(content) = fs::read_to_string(root.join("config.json"))
+        && let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content)
+    {
+        for key in ["model_name", "model_type", "architectures"] {
+            if let Some(v) = map.get(key) {
+                pkg.insert(key.to_string(), v.clone());
+            }
+        }
+        if let Some(v) = map.get("_name_or_path") {
+            pkg.insert("provenance".to_string(), v.clone());
+        }
     }
 
-    let caps = ModelCapabilities {
-        is_instruct: if is_silero_vad {
-            false
-        } else {
-            !inferred_capabilities.is_empty()
-        },
-        has_chat_template: false,
-        has_tool_support: false,
-        has_json_support: false,
-        is_moe: false,
-        is_vision: if is_silero_vad {
-            false
-        } else {
-            model_name.to_lowercase().contains("vision")
-                || model_name.to_lowercase().contains("yolo")
-                || model_name.to_lowercase().contains("resnet")
-        },
-        context_length: 0,
-        quantization: None,
-        parameter_count: if author == "Supertonic AI" {
-            Some("99M".to_string())
-        } else {
-            None
-        },
-    };
+    if let Ok(content) = fs::read_to_string(root.join("onnx/tts.json"))
+        && let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content)
+    {
+        for key in ["tts_version", "split"] {
+            if let Some(v) = map.get(key) {
+                pkg.insert(key.to_string(), v.clone());
+            }
+        }
+        if let Some(sr) = map.get("ae").and_then(|v| v.get("sample_rate")) {
+            pkg.insert("sample_rate".to_string(), sr.clone());
+        }
+        if let Some(v) = map.get("model_name") {
+            pkg.insert("model_name".to_string(), v.clone());
+        }
+    }
 
+    let styles = root.join("voice_styles");
+    if styles.is_dir()
+        && let Ok(entries) = fs::read_dir(&styles)
+    {
+        let mut stems: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(String::from)
+            })
+            .collect();
+        stems.sort();
+        if !stems.is_empty() {
+            pkg.insert(
+                "available_styles".to_string(),
+                Value::Array(stems.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+
+    let samples = root.join("audio_samples");
+    if samples.is_dir()
+        && let Ok(entries) = fs::read_dir(&samples)
+    {
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x == "wav" || x == "mp3")
+            })
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .collect();
+        names.sort();
+        if !names.is_empty() {
+            pkg.insert(
+                "audio_samples".to_string(),
+                Value::Array(names.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+
+    let tokenizers: Vec<&str> = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+    ]
+    .into_iter()
+    .filter(|f| root.join(f).exists())
+    .collect();
+    if !tokenizers.is_empty() {
+        pkg.insert(
+            "tokenizer_files".to_string(),
+            Value::Array(
+                tokenizers
+                    .into_iter()
+                    .map(|s| Value::String(s.to_string()))
+                    .collect(),
+            ),
+        );
+    }
+
+    pkg
+}
+
+struct OnnxUnit {
+    name: String,
+    author: String,
+    version: String,
+    root_display: String,
+    load_bytes: u64,
+    parameter_count: u64,
+    classes: Vec<onnx_graph::OnnxModelClass>,
+    capabilities: Vec<Capability>,
+    containers: Vec<Value>,
+    package: HashMap<String, Value>,
+}
+
+/// Inspect one unit: scan every container's graph, compose the unit's
+/// capabilities, and read whatever package evidence exists.
+fn build_onnx_unit(root: &Path, containers: &[std::path::PathBuf], is_file: bool) -> OnnxUnit {
+    let package = read_package_evidence(root);
+
+    let mut classes = Vec::new();
+    let mut container_values = Vec::new();
+    let mut load_bytes: u64 = 0;
+    let mut parameter_count: u64 = 0;
+
+    for c in containers {
+        let bytes = fs::metadata(c).map_or(0, |m| m.len());
+        load_bytes = load_bytes.saturating_add(bytes);
+        let file = c
+            .strip_prefix(root)
+            .unwrap_or(c)
+            .to_string_lossy()
+            .into_owned();
+        match onnx_graph::read_onnx_graph(c) {
+            Ok(io) => {
+                let class = onnx_graph::classify(&io.inputs, &io.outputs);
+                parameter_count = parameter_count.saturating_add(io.parameter_count());
+                classes.push(class);
+                container_values.push(json!({
+                    "file": file,
+                    "bytes": bytes,
+                    "class": class.as_str(),
+                    "parameter_count": io.parameter_count(),
+                    "inputs": io.inputs.iter().map(onnx_tensor_value).collect::<Vec<_>>(),
+                    "outputs": io.outputs.iter().map(onnx_tensor_value).collect::<Vec<_>>(),
+                }));
+            }
+            Err(e) => {
+                warn!("ONNX container unreadable: {} ({e})", c.display());
+                classes.push(onnx_graph::OnnxModelClass::Unknown);
+                container_values.push(json!({
+                    "file": file,
+                    "bytes": bytes,
+                    "class": "unknown",
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+
+    let name = package
+        .get("model_name")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| {
+            package
+                .get("provenance")
+                .and_then(Value::as_str)
+                .and_then(|p| p.rsplit('/').next().map(String::from))
+        })
+        .unwrap_or_else(|| {
+            if is_file {
+                containers
+                    .first()
+                    .and_then(|c| c.file_stem())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("ONNX unit")
+                    .to_string()
+            } else {
+                root.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("ONNX unit")
+                    .to_string()
+            }
+        });
+
+    let author = package
+        .get("provenance")
+        .and_then(Value::as_str)
+        .and_then(|p| p.split('/').next())
+        .filter(|org| !org.is_empty())
+        .unwrap_or("Unknown")
+        .to_string();
+
+    let version = package
+        .get("tts_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    let capabilities = compose_onnx_capabilities(&classes);
+
+    OnnxUnit {
+        name,
+        author,
+        version,
+        root_display: root.to_string_lossy().into_owned(),
+        load_bytes,
+        parameter_count,
+        classes,
+        capabilities,
+        containers: container_values,
+        package,
+    }
+}
+
+fn onnx_unit_value(unit: &OnnxUnit) -> Value {
+    json!({
+        "name": unit.name,
+        "root": unit.root_display,
+        "load_bytes": unit.load_bytes,
+        "parameter_count": unit.parameter_count,
+        "classes": unit
+            .classes
+            .iter()
+            .map(onnx_graph::OnnxModelClass::as_str)
+            .collect::<Vec<_>>(),
+        "capabilities": unit.capabilities,
+        "package": unit.package,
+        "containers": unit.containers,
+    })
+}
+
+/// Discover the units under a path. A directory that holds containers
+/// directly or carries package files *is* one unit; any other directory is
+/// a group whose children are discovered in turn — so `assets/` becomes
+/// llm + stt + supertonic-3 + translation/{marian, nllb} + vad.
+fn discover_onnx_units(
+    path: &Path,
+    depth: u32,
+    out: &mut Vec<(std::path::PathBuf, Vec<std::path::PathBuf>)>,
+) {
+    if depth > ONNX_MAX_WALK_DEPTH {
+        return;
+    }
+    if path.is_file() {
+        if path.extension().is_some_and(|e| e == "onnx") {
+            out.push((path.to_path_buf(), vec![path.to_path_buf()]));
+        }
+        return;
+    }
+    let holds_directly = fs::read_dir(path).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "onnx"))
+    });
+    let has_package = path.join("config.json").exists()
+        || path.join("onnx/tts.json").exists()
+        || path.join("tokenizer.json").exists();
+    if holds_directly || has_package {
+        let mut own = Vec::new();
+        collect_onnx_containers(path, 0, &mut own);
+        if !own.is_empty() {
+            out.push((path.to_path_buf(), own));
+        }
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    let mut children: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    children.sort();
+    for child in children {
+        let hidden = child
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if hidden {
+            continue;
+        }
+        discover_onnx_units(&child, depth + 1, out);
+    }
+}
+
+/// Read an ONNX path: one unit, or a group of units. The graph signatures
+/// are the only capability witness; package files add names and provenance.
+fn parse_onnx<P: AsRef<Path>>(path: P) -> std::io::Result<ModelInspectionReport> {
+    let path = path.as_ref();
+
+    let mut discovered: Vec<(std::path::PathBuf, Vec<std::path::PathBuf>)> = Vec::new();
+    discover_onnx_units(path, 0, &mut discovered);
+    if discovered.is_empty() {
+        let message = if path.is_file() {
+            "not an ONNX container file"
+        } else {
+            "no ONNX containers under path"
+        };
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, message));
+    }
+
+    let units: Vec<OnnxUnit> = discovered
+        .iter()
+        .map(|(root, own)| build_onnx_unit(root, own, root.is_file()))
+        .collect();
+
+    let mut raw = HashMap::new();
     raw.insert(
         "path".to_string(),
-        Value::String(dir.to_string_lossy().into_owned()),
+        Value::String(path.to_string_lossy().into_owned()),
+    );
+    raw.insert(
+        "units".to_string(),
+        Value::Array(units.iter().map(onnx_unit_value).collect()),
+    );
+    let load_bytes: u64 = units.iter().map(|u| u.load_bytes).sum();
+    raw.insert("load_bytes".to_string(), Value::Number(load_bytes.into()));
+    raw.insert(
+        "footprint_bytes".to_string(),
+        Value::Number(get_recursive_size(path).into()),
     );
 
-    let (version_str, arch_str) = if is_silero_vad {
-        extract_silero_info(filename)
-    } else {
-        (version.clone(), String::new())
-    };
-
-    let final_name = if is_silero_vad {
-        format!("Silero VAD v{version_str}")
-    } else {
-        model_name
-    };
-
-    let final_author = if is_silero_vad {
-        "Silero".to_string()
-    } else {
-        author
-    };
-
-    let final_version = if is_silero_vad {
-        version_str.clone()
-    } else {
-        version
-    };
-
-    if is_silero_vad {
-        raw.insert(
-            "general.architecture".to_string(),
-            Value::String("silero".to_string()),
-        );
-        raw.insert(
-            "general.author".to_string(),
-            Value::String("Silero".to_string()),
-        );
-        raw.insert(
-            "general.license".to_string(),
-            Value::String("MIT".to_string()),
-        );
-        raw.insert(
-            "silero.min_sample_rate".to_string(),
-            Value::Number(8000.into()),
-        );
-        raw.insert(
-            "silero.max_sample_rate".to_string(),
-            Value::Number(16000.into()),
-        );
-        raw.insert(
-            "silero.version".to_string(),
-            Value::String(version_str.clone()),
-        );
-        raw.insert("architecture".to_string(), Value::String(arch_str));
-        raw.insert("streaming".to_string(), Value::Bool(true));
-        raw.insert("author".to_string(), Value::String("Silero".to_string()));
-        raw.insert("license".to_string(), Value::String("MIT".to_string()));
-        raw.insert("min_sample_rate".to_string(), Value::Number(8000.into()));
-        raw.insert("max_sample_rate".to_string(), Value::Number(16000.into()));
-        raw.insert("version".to_string(), Value::String(version_str));
+    // The primary unit's package evidence stays top-level for consumers.
+    if let Some(primary) = units.first() {
+        for (k, v) in &primary.package {
+            raw.entry(k.clone()).or_insert_with(|| v.clone());
+        }
     }
 
+    let mut inferred = Vec::new();
+    let mut parameter_count: u64 = 0;
+    for unit in &units {
+        for c in &unit.capabilities {
+            push_unique(&mut inferred, *c);
+        }
+        parameter_count = parameter_count.saturating_add(unit.parameter_count);
+    }
+
+    let name = if let [only] = units.as_slice() {
+        only.name.clone()
+    } else {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("ONNX group")
+            .to_string()
+    };
+    let version = units
+        .first()
+        .map_or_else(|| "unknown".to_string(), |u| u.version.clone());
+    let author = units
+        .first()
+        .map_or_else(|| "Unknown".to_string(), |u| u.author.clone());
+
     Ok(ModelInspectionReport {
-        inferred_capabilities,
-        family: if is_silero_vad {
-            ModelFamily::AudioSegmentation
-        } else {
-            ModelFamily::Onnx
-        },
-        name: final_name,
-        version: final_version,
-        author: final_author,
+        inferred_capabilities: inferred,
+        family: ModelFamily::Onnx,
+        name,
+        version,
+        author,
         uuid: String::new(),
-        capabilities: caps,
+        capabilities: ModelCapabilities {
+            is_instruct: false,
+            has_chat_template: false,
+            has_tool_support: false,
+            has_json_support: false,
+            is_moe: false,
+            is_vision: false,
+            context_length: 0,
+            quantization: None,
+            parameter_count: (parameter_count > 0).then(|| format_parameter_count(parameter_count)),
+        },
         raw_metadata: raw,
     })
 }

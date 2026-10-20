@@ -1,13 +1,11 @@
 use clap::Parser;
 use color_eyre::Result;
 use lmsafe_zone::Verdict;
-use lmsafe_zone::admission::{AdmissionReport, assess_with_monitor};
+use lmsafe_zone::admission::{AdmissionReport, assess_model_path_with_monitor};
 use std::path::PathBuf;
 use std::time::Duration;
 use sysreflect_core::{MetricStatus, ProcessInfo, SystemMonitor, format_bytes};
-use sysreflect_model::{
-    ModelInspectionReport, get_recursive_size, inspect_model_file, resolve_model_path,
-};
+use sysreflect_model::{ModelInspectionReport, inspect_model_file};
 
 #[derive(Parser)]
 #[command(
@@ -228,6 +226,45 @@ fn print_guard(report: Option<&ModelInspectionReport>, verdict: &AdmissionReport
             }
             println!("  Inferred:      {:?}", r.inferred_capabilities);
 
+            if let Some(serde_json::Value::Array(units)) = r.raw_metadata.get("units") {
+                for u in units {
+                    let name = u
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let classes: Vec<&str> = u
+                        .get("classes")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
+                        .unwrap_or_default();
+                    let load = u
+                        .get("load_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    println!(
+                        "  Unit:          {name} [{}] ({})",
+                        classes.join(", "),
+                        format_bytes(load)
+                    );
+                }
+            }
+
+            if let (Some(load), Some(footprint)) = (
+                r.raw_metadata
+                    .get("load_bytes")
+                    .and_then(serde_json::Value::as_u64),
+                r.raw_metadata
+                    .get("footprint_bytes")
+                    .and_then(serde_json::Value::as_u64),
+            ) && load != footprint
+            {
+                println!(
+                    "  Footprint:     {} on disk ({} loaded)",
+                    format_bytes(footprint),
+                    format_bytes(load)
+                );
+            }
+
             if let Some(serde_json::Value::Array(styles)) = r.raw_metadata.get("available_styles") {
                 let style_list: Vec<&str> = styles.iter().filter_map(|s| s.as_str()).collect();
                 println!("  Voice Styles:  {}", style_list.join(", "));
@@ -340,16 +377,14 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
-            let resolved = resolve_model_path(&file);
             let report = inspect_model_file(&file).ok();
-            let model_size = get_recursive_size(&resolved);
 
             let mut sys = SystemMonitor::new();
             sys.refresh();
 
             let snapshot = build_system_snapshot(&sys);
             // One rule, owned by lmsafe-zone. The TUI renders this same report.
-            let verdict = assess_with_monitor(&sys, model_size, safety_margin);
+            let verdict = assess_model_path_with_monitor(&sys, &file, safety_margin);
 
             if json {
                 let cli_report = CliReport {
