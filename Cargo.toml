@@ -13,13 +13,17 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98.1"
 authors = ["ggdev-ops <ggdevnight@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ggdev-ops/lmsafe"
+homepage = "https://github.com/ggdev-ops/lmsafe"
+documentation = "https://docs.rs"
 
 # description is deliberately NOT inherited: each crate describes itself.
 
 [workspace.dependencies]
-sysreflect-core = { path = "sysreflect-core" }
-sysreflect-model = { path = "sysreflect-model" }
-lmsafe-zone = { path = "lmsafe-zone" }
+sysreflect-core = { path = "sysreflect-core", version = "0.1.0" }
+sysreflect-model = { path = "sysreflect-model", version = "0.1.0" }
+lmsafe-zone = { path = "lmsafe-zone", version = "0.1.0" }
 
 # CLI Argument Parsing
 clap = { version = "4.6.7", features = ["derive"] }

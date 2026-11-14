@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Model and media reflection: family detection, binary-header parsing, capability inference"
 
 # Model + media reflection: what is this file, what can it do, how big is it.
