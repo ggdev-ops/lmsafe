@@ -183,13 +183,13 @@ The repository consists of:
 1. **`sysreflect-core` (Rust Library)**: System reflection — the telemetry engine. CPU, memory, network, processes, host info. Compiled as `libsysreflect_core.so`.
 2. **`sysreflect-model` (Rust Library)**: Model & media reflection — magic-byte family detection, GGUF/GGML/LiteRT/safetensors parsing, capability inference. All metadata is parsed locally from binary headers — no external APIs.
 3. **`lmsafe-zone` (Rust Library)**: The Safe Zone — storage layout for Model and Media Safe Zones, plus the single admission rule (`is this model safe to load?`) that every front-end renders.
-4. **`lmsafe-ffi` (Rust FFI Layer)**: A dedicated C FFI wrapper that exposes a C-compatible interface (`lmsafe-ffi/lmsafe.h`) for foreign-language consumers. Compiled as `liblmsafe.so`.
+4. **`lmsafe` (Rust FFI Layer)**: A dedicated C FFI wrapper that exposes a C-compatible interface (`lmsafe/lmsafe.h`) for foreign-language consumers. Compiled as `liblmsafe.so`.
 5. **`lmsafe-cli` & `lmsafe-tui` (Rust Tools)**: Command-line utilities for inspecting models and monitoring system resources.
 
 The dependency direction is one-way, with no cycles:
 
 ```
-sysreflect-core ← sysreflect-model ← lmsafe-zone ← { lmsafe-ffi, lmsafe-cli, lmsafe-tui }
+sysreflect-core ← sysreflect-model ← lmsafe-zone ← { lmsafe, lmsafe-cli, lmsafe-tui }
 ```
 
 Safe Zone logic *depends on* reflection; reflection knows nothing about the Safe Zone.
@@ -221,14 +221,14 @@ Safe Zone logic *depends on* reflection; reflection knows nothing about the Safe
 
 ---
 
-### 2. Consuming via FFI (`lmsafe-ffi`)
+### 2. Consuming via FFI (`lmsafe`)
 
-Foreign-language consumers call into the native Rust engine through the C API declared in `lmsafe-ffi/lmsafe.h`. The engine returns complex metadata as a JSON string, which the caller decodes into its own domain types (`ModelInspectionReport`, `Capability`, `ModelFamily`, `MediaFamily`).
+Foreign-language consumers call into the native Rust engine through the C API declared in `lmsafe/lmsafe.h`. The engine returns complex metadata as a JSON string, which the caller decodes into its own domain types (`ModelInspectionReport`, `Capability`, `ModelFamily`, `MediaFamily`).
 
 ```mermaid
 graph TD
     UI[App UI / User File Picker] -->|Selects Model Path| App[FFI Consumer]
-    App -->|C FFI: lmsafe_copy_to_safe_zone| Rust[lmsafe-ffi / sysreflect-core]
+    App -->|C FFI: lmsafe_copy_to_safe_zone| Rust[lmsafe / sysreflect-core]
     Rust -->|Parses Metadata| Inspector[Model Inspection Report]
     Rust -->|Calculates Safety| Guard[Memory Guard vs Free RAM]
     
@@ -238,7 +238,7 @@ graph TD
     Accept -->|Passes Path| Engine[Inference Engine (Llama/Whisper)]
 ```
 
-#### API Interface (C, see `lmsafe-ffi/lmsafe.h`)
+#### API Interface (C, see `lmsafe/lmsafe.h`)
 ```c
 // Model Inspection & Safety (JSON via lmsafe_free_string)
 char* lmsafe_inspect_model(const char* path);

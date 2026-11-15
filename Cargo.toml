@@ -3,7 +3,7 @@ members = [
     "sysreflect-core",
     "sysreflect-model",
     "lmsafe-zone",
-    "lmsafe-ffi",
+    "lmsafe",
     "lmsafe-tui", "lmsafe-cli",
 ]
 resolver = "2"

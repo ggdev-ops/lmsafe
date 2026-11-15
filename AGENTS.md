@@ -122,14 +122,14 @@
 - sysreflect-core   — System reflection: telemetry only (SystemMonitor, MetricStatus, format_bytes)
 - sysreflect-model  — Model & media reflection: family detection, GGUF/GGML/LiteRT/safetensors parsing, capability inference
 - lmsafe-zone       — Safe Zone: storage layout + the ONE admission rule (`lmsafe_zone::admission`)
-- lmsafe-ffi        — C FFI wrapper → liblmsafe.{a,so,dylib}. Two names on purpose: cargo
-                      addresses the package (`cargo build -p lmsafe-ffi`), hosts link the
-                      artifact (`-llmsafe`). Nothing depends on it as a Rust lib — boundary leaf.
+- lmsafe            — C FFI wrapper → liblmsafe.{a,so,dylib}. Package, lib and artifact all
+                      read "lmsafe" (`cargo build -p lmsafe`, link `-llmsafe`). Nothing depends
+                      on it as a Rust lib — boundary leaf.
 - lmsafe-cli        — CLI tool. No args = one-shot telemetry snapshot; `inspect --file <FILE>` = model inspection (+ `--json`)
 - lmsafe-tui        — Terminal UI dashboard
 
 ## Dependency Direction (no cycles)
-sysreflect-core ← sysreflect-model ← lmsafe-zone ← {lmsafe-ffi, lmsafe-cli, lmsafe-tui}
+sysreflect-core ← sysreflect-model ← lmsafe-zone ← {lmsafe, lmsafe-cli, lmsafe-tui}
 
 ## Architecture (the chain a model travels)
 Host (any consumer via the C FFI — lmsafe names none) → SafeZone (lmsafe-zone) → Gates (RAM gate + copy gate) → Inspector (sysreflect-model + sysreflect-core).
