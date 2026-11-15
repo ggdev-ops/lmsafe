@@ -1,18 +1,18 @@
 [package]
-name = "lmsafe-ffi"
+name = "lmsafe"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "C FFI bindings for lmsafe (liblmsafe.so)"
 
 [lib]
-# Two names, two domains, on purpose:
-#   cargo speaks the PACKAGE name   -> cargo build -p lmsafe-ffi
-#   the world speaks the LIB name   -> link -llmsafe, ship liblmsafe.{a,so}
-# The artifact is the product ("lmsafe"); the package is workspace
-# bookkeeping. Nothing in the workspace depends on this crate as a Rust
-# library — it is the boundary leaf — so only the artifact name is public.
+# One name, one artifact: package, lib, and shipped library all read
+# "lmsafe". Nothing in the workspace depends on this crate as a Rust
+# library — it is the boundary leaf — so the artifact name is the public one.
 name = "lmsafe"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
