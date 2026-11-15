@@ -1,5 +1,7 @@
 # Local Metaverse Safe (`lmsafe`): The Celestial Safe Zone Contract
 
+[![Crates.io](https://img.shields.io/crates/v/lmsafe.svg)](https://crates.io/crates/lmsafe) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+
 `lmsafe` (Local Metaverse Safe) is an architecture designed to host, manage, inspect, and execute Local Models (LMs) within a secure, predictable, and self-disciplined environment. Everything is local — no internet connection required. The Shield reads binary headers directly.
 
 **Who this serves:** any local AI host, through the C FFI — language-agnostic by design, no consumer baked in. The shared vocabulary between Developer and User lives in [GLOSSARY.md](GLOSSARY.md); where this README and the glossary differ, the glossary wins.
