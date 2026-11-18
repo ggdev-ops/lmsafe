@@ -257,22 +257,98 @@ pub fn copy_media_to_safe_zone<P: AsRef<Path>>(
         ));
     }
 
-    // Security Guard Storage Check
-    if !is_storage_safe_for_duplication(source, safety_margin) {
-        return Err(io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            "Insufficient free disk space in SafeZone for media file duplication",
-        ));
-    }
-
     let file_name = source
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid source filename"))?;
     let dest_dir = get_media_safe_zone_dir(family)?;
     let dest_path = dest_dir.join(file_name);
 
-    fs::copy(source, &dest_path)?;
+    if is_sandboxed() {
+        // iOS / Android (sandboxed): copy the file — the original path may not
+        // stay accessible.
+        if !is_storage_safe_for_duplication(source, safety_margin) {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "Insufficient free disk space in SafeZone for media file duplication",
+            ));
+        }
+        fs::copy(source, &dest_path)?;
+    } else {
+        // Desktop (Linux / macOS / Windows): do NOT duplicate. Create a
+        // symlink (ln -s) so the SafeZone "provides the media natively"
+        // without copying gigabytes of data. Re-create on re-import.
+        if dest_path.exists() || dest_path.is_symlink() {
+            let _ = fs::remove_file(&dest_path);
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(source, &dest_path)?;
+        }
+        #[cfg(not(unix))]
+        {
+            // Fallback for non-Unix targets: copy (no symlink primitive).
+            if !is_storage_safe_for_duplication(source, safety_margin) {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "Insufficient free disk space in SafeZone for media file duplication",
+                ));
+            }
+            fs::copy(source, &dest_path)?;
+        }
+    }
+
     Ok(dest_path)
+}
+
+/// Import every media file found under `source_dir` into the `SafeZone`.
+///
+/// On sandboxed targets each file is copied; on desktop targets each file is
+/// symlinked (ln -s) so the `SafeZone` references the original data in place.
+///
+/// # Errors
+///
+/// IO errors from walking the directory or storing an individual file.
+pub fn import_media_directory<P: AsRef<Path>>(
+    source_dir: P,
+    safety_margin: f64,
+) -> io::Result<Vec<PathBuf>> {
+    let dir = source_dir.as_ref();
+    if !dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Source directory does not exist or is not a directory",
+        ));
+    }
+
+    let mut imported: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            // Recurse into subdirectories.
+            if let Ok(mut nested) = import_media_directory(&path, safety_margin) {
+                imported.append(&mut nested);
+            }
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let Some(family) = MediaFamily::from_extension(ext) else {
+            continue;
+        };
+        match copy_media_to_safe_zone(&path, family, safety_margin) {
+            Ok(dest) => imported.push(dest),
+            Err(e) => {
+                // Skip individual failures but keep going.
+                tracing::warn!("Failed to import {}: {}", path.display(), e);
+            }
+        }
+    }
+    Ok(imported)
 }
 
 /// Remove every stored model artifact for a family.

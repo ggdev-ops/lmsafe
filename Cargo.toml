@@ -23,7 +23,7 @@ documentation = "https://docs.rs"
 [workspace.dependencies]
 sysreflect-core = { path = "sysreflect-core", version = "0.1.0" }
 sysreflect-model = { path = "sysreflect-model", version = "0.1.0" }
-lmsafe-zone = { path = "lmsafe-zone", version = "0.1.0" }
+lmsafe-zone = { path = "lmsafe-zone", version = "0.1.2" }
 
 # CLI Argument Parsing
 clap = { version = "4.6.7", features = ["derive"] }
